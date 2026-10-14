@@ -120,5 +120,8 @@ go.work.sum
 bindings/go/pkg/
 bindings/go/go.sum
 
+build/*
+configure~
+
 # Allow Gitlab CI config file (otherwise matched by build-* ignore above)
 !.ci/pipeline/*_matrix.yaml

@@ -3,9 +3,14 @@
 
 #include <uct/api/uct.h>
 #include <uct/base/uct_iface.h>
+#include <stdint.h>
 
 #define UCT_CXL_FIFO_ELEM_SIZE 64
 #define UCT_CXL_FIFO_DEPTH     16
+
+typedef struct uct_cxl_md uct_cxl_md_t;   /* opaque forward decl, full def in cxl_md.h */
+
+typedef uint64_t uct_cxl_iface_addr_t;
 
 typedef struct uct_cxl_fifo_ctl {
     volatile uint64_t head;   /* producer index */

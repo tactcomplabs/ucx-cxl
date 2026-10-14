@@ -1,12 +1,14 @@
 
 #include "cxl_iface.h"
 
-// are these arg types correct? want super md or this one?
 ucs_status_t
 uct_cxl_iface_query_tl_devices(uct_md_h md, uct_tl_device_resource_t **tl_devices_p,
                           unsigned *num_tl_devices_p)
 {
-
+  // TODO: good enough for linking but currently precludes actually opening the iface 
+    *tl_devices_p = NULL;
+    *num_tl_devices_p = 0;
+    return UCS_OK;
 }
 
 // TODO: any other parameters? Needs md pointer?
@@ -15,10 +17,14 @@ static UCS_CLASS_INIT_FUNC(uct_cxl_iface_t, uct_md_h md, uct_worker_h worker,
                             const uct_iface_params_t *params,
                             const uct_iface_config_t *tl_config)
 {
-    uct_cxl_iface_t *iface = ucs_derived_of(params->iface, uct_cxl_iface_t);
+    self->md       = ucs_derived_of(md, uct_cxl_md_t);
+    self->fifo_ctl = UCS_PTR_BYTE_OFFSET(self->md->aperture_base, UCT_CXL_CTRL_OFFSET);
+    self->fifo     = UCS_PTR_BYTE_OFFSET(self->md->aperture_base, UCT_CXL_FIFO_OFFSET);
 
     // do we want some UCS_STATS_ARG in this? What args would we want here?
-    UCS_CLASS_CALL_SUPER_INIT(uct_base_iface_t, &uct_cxl_iface_ops, &uct_cxl_iface_internal_ops, md, worker, params, tl_config);
+    UCS_CLASS_CALL_SUPER_INIT(uct_base_iface_t, &uct_cxl_iface_ops, &uct_cxl_iface_internal_ops, md, worker, params, tl_config UCS_STATS_ARG(
+        (params->field_mask & UCT_IFACE_PARAM_FIELD_STATS_ROOT) ?
+                params->stats_root : NULL) UCS_STATS_ARG("cxl"));
     return UCS_OK;
 
 }
@@ -49,6 +55,18 @@ uct_cxl_iface_progress(uct_iface_h iface)
 static ucs_status_t
 uct_cxl_iface_query(uct_iface_h iface, uct_iface_attr_t *iface_attr)
 {
+  uct_cxl_iface_t *iface = ucs_derived_of(tl_iface, uct_cxl_iface_t);
+
+  uct_base_iface_query(&iface->super, iface_attr);
+  iface_attr->cap.flags      = UCT_IFACE_FLAG_PUT_BCOPY |
+                                UCT_IFACE_FLAG_GET_BCOPY |
+                                UCT_IFACE_FLAG_AM_SHORT  |
+                                UCT_IFACE_FLAG_AM_BCOPY  |
+                                UCT_IFACE_FLAG_PENDING;
+  iface_attr->iface_addr_len = sizeof(uct_cxl_iface_addr_t);
+  iface_attr->device_addr_len = 0;
+  iface_attr->ep_addr_len    = 0;
+  iface_attr->cap.put.max_bcopy = UCT_CXL_FIFO_ELEM_SIZE; /* placeholder sizing */
   return UCS_OK;
 }
 
@@ -70,9 +88,8 @@ static ucs_status_t uct_cxl_iface_get_address(uct_iface_h tl_iface,
 {
     const uct_cxl_iface_t *iface = ucs_derived_of(tl_iface, uct_cxl_iface_t);
 
-    // TODO: iface does not have this field (adapted from sm/self iface).
-    // Implement some other way, but returning UCS_OK fine for now
-    //*(uct_cxl_iface_addr_t*)addr = iface->id;
+    // TODO: currently just a placeholder
+    *(uct_cxl_iface_addr_t*)addr = 0;  /* or a real per-iface id */
     return UCS_OK;
 }
 
@@ -83,7 +100,7 @@ static uct_iface_internal_ops_t uct_cxl_iface_internal_ops = {
     .ep_query               = (uct_ep_query_func_t)ucs_empty_function_return_unsupported,
     .ep_invalidate          = (uct_ep_invalidate_func_t)ucs_empty_function_return_unsupported,
     .ep_connect_to_ep_v2    = (uct_ep_connect_to_ep_v2_func_t)ucs_empty_function_return_unsupported,
-    .iface_is_reachable_v2  = uct_self_iface_is_reachable_v2,
+    .iface_is_reachable_v2  = uct_cxl_iface_is_reachable_v2,
     .ep_is_connected        = uct_base_ep_is_connected,
     .ep_get_device_ep       = (uct_ep_get_device_ep_func_t)ucs_empty_function_return_unsupported
 };
@@ -115,8 +132,7 @@ static uct_iface_ops_t uct_cxl_iface_ops = {
     .iface_progress_disable   = (uct_iface_progress_disable_func_t)ucs_empty_function,
     .iface_progress           = (uct_iface_progress_func_t)ucs_empty_function_return_zero,
     .iface_close              = UCS_CLASS_DELETE_FUNC_NAME(uct_cxl_iface_t),
-    //.iface_query              = uct_cxl_iface_query,
-    .iface_query              = (uct_iface_query_func_t)ucs_empty_function_return_unsupported,
+    .iface_query              = uct_cxl_iface_query,
     .iface_get_device_address = (uct_iface_get_device_address_func_t)ucs_empty_function_return_success,
     .iface_get_address        = uct_cxl_iface_get_address,
     .iface_is_reachable       = uct_base_iface_is_reachable

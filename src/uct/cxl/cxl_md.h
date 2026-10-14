@@ -23,12 +23,12 @@ typedef struct uct_cxl_packed_rkey {
     size_t   length;
 } UCS_S_PACKED uct_cxl_packed_rkey_t;
 
-typedef struct uct_cxl_md {
+struct uct_cxl_md {
     uct_md_t super;
     void     *aperture_base;   /* mmap'd VA of the CXL BAR */
     size_t   aperture_size;    /* discovered/configured window size */
     size_t   rma_next_offset;  /* bump allocator cursor, starts at UCT_CXL_RMA_OFFSET */
-} uct_cxl_md_t;
+};
 
 typedef struct uct_cxl_md_config {
     uct_md_config_t super;

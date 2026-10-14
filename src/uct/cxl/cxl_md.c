@@ -11,32 +11,44 @@ ucs_status_t uct_cxl_md_open(uct_component_t *component, const char *md_name,
   /* opens the device node, mmap()s it with uncached/device attributes, fills 
   * in aperture_base/aperture_size, sets rma_next_offset = UCT_CXL_RMA_OFFSET
   */
-
+  // TODO: REALLY needs to be implemented; this will only allow linking, not any device usage
+  return UCS_ERR_UNSUPPORTED;
 }
 
-// what do these functions need? What should they return?
+// Below functions are currently replaced ucs_empty_function_return_unsupported,
+// though they may be need to be implemented beyond linking
+/*
 void uct_cxl_mem_alloc() {}
 void uct_cxl_mem_free() {}
 
 void uct_cxl_mem_reg() {}
 void uct_cxl_mem_dereg() {}
-void uct_cxl_mkey_pack() {}
+*/
+
+ucs_status_t
+uct_cxl_mkey_pack(uct_md_h md, uct_mem_h memh, void *address, size_t length, const uct_md_mkey_pack_params_t *params, void *mkey_buffer) 
+{
+  //TODO: needs to be supported for our plan, but get everything linking first
+  return UCS_ERR_UNSUPPORTED;
+}
 
 static ucs_status_t
 uct_cxl_rkey_unpack(uct_component_t *component, const void *rkey_buffer,
                         const uct_rkey_unpack_params_t *params,
                         uct_rkey_t *rkey_p, void **handle_p)
 {
-
+  // TODO: implement
+  return UCS_ERR_UNSUPPORTED;
 }
 
-static ucs_status_t
-void uct_cxl_rkey_release(uct_component_t *component, const void *rkey_buffer,
-                        const uct_rkey_unpack_params_t *params,
-                        uct_rkey_t *rkey_p, void **handle_p)
+static ucs_status_t uct_cxl_md_query(uct_md_h md, uct_md_attr_v2_t *attr)
 {
-
+    uct_md_base_md_query(attr);
+    attr->reg_mem_types    = UCS_BIT(UCS_MEMORY_TYPE_HOST);
+    attr->access_mem_types = UCS_BIT(UCS_MEMORY_TYPE_HOST);
+    return UCS_OK;
 }
+
 
 uct_md_ops_t uct_cxl_md_ops = {
     .close              = (uct_md_close_func_t)ucs_empty_function,
@@ -58,7 +70,7 @@ static uct_component_t uct_cxl_component = {
     .cm_open            = (uct_component_cm_open_func_t)ucs_empty_function_return_unsupported,
     .rkey_unpack        = uct_cxl_rkey_unpack,
     .rkey_ptr           = uct_sm_rkey_ptr,       /* reuse from uct/sm/base */
-    .rkey_release       = uct_cxl_rkey_release,
+    .rkey_release       = (uct_component_rkey_release_func_t)ucs_empty_function_return_success,
     .rkey_compare       = uct_base_rkey_compare,
     .name               = "cxl",
     .md_config          = {

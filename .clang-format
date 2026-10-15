@@ -1,11 +1,8 @@
 # C
 BasedOnStyle: LLVM
-AlignEscapedNewlines: Indent
 AlignConsecutiveAssignments: true
 AlignConsecutiveDeclarations: false
-AlignConsecutiveStructMembers: true
 AlignConsecutiveMacros: true
-AlignDeclarationByPointer: true
 AlignAfterOpenBracket: true
 AlignOperands: true
 PointerAlignment: Right
@@ -19,14 +16,11 @@ AllowShortFunctionsOnASingleLine: false
 AllowShortIfStatementsOnASingleLine: false
 AllowShortLoopsOnASingleLine: false
 AllowShortEnumsOnASingleLine: false
-AllowDesignatedInitializersOnASingleLine: false
 AlwaysBreakAfterReturnType: None
 PenaltyReturnTypeOnItsOwnLine: 20
 PenaltyBreakAssignment: 100
 PenaltyExcessCharacter: 100
 PenaltyBreakBeforeFirstCallParameter: 100
-PenaltyBreakMemberAccess: 250
-PenaltyBreakLastMemberAccess: 300
 PenaltyIndentedWhitespace: 0
 ColumnLimit: 80
 AlwaysBreakBeforeMultilineStrings: false
@@ -126,7 +120,6 @@ CompactNamespaces: false
 ConstructorInitializerAllOnOneLineOrOnePerLine: true
 ConstructorInitializerIndentWidth: 4
 Cpp11BracedListStyle: true
-Cpp11BracedListLineBreak: true
 FixNamespaceComments: true
 NamespaceIndentation: None
 UseTab: Never

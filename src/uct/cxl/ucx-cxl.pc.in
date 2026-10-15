@@ -1,0 +1,15 @@
+#
+# Copyright (c) Tactical Computing Laboratories, LLC. 2026. ALL RIGHTS RESERVED.
+#
+# See file LICENSE for terms.
+#
+
+prefix = @prefix@
+exec_prefix = @exec_prefix@
+libdir = @libdir@/ucx
+
+Name: @PACKAGE@-cxl
+Description: Unified Communication X Library CXL module
+Version: @VERSION@
+Libs:
+Libs.private: -L${libdir} -luct_cxl -Wl,--undefined=uct_cxl_init

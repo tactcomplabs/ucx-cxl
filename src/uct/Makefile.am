@@ -7,7 +7,7 @@
 # See file LICENSE for terms.
 #
 
-SUBDIRS = . gaudi cuda ib rocm sm ugni ze
+SUBDIRS = . cxl gaudi cuda ib rocm sm ugni ze
 
 lib_LTLIBRARIES    = libuct.la
 libuct_la_CFLAGS   = $(BASE_CFLAGS) $(LT_CFLAGS)

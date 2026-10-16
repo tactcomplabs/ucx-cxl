@@ -36,6 +36,8 @@ typedef struct uct_cxl_md_config {
     char *accel_dev_path;
     // used to mmap, reading local backing mem (peer's writes)
     char *local_dev_path;
+    // size of the HDM-decoded window exposed by accel_dev_path
+    size_t aperture_size;
 } uct_cxl_md_config_t;
 
 extern uct_component_t uct_cxl_component;

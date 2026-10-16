@@ -1,23 +1,34 @@
 #include <uct/base/uct_component.h>
 #include <uct/sm/base/sm_md.h>
 #include "cxl_md.h"
+#include <ucs/debug/log.h>
+#include <ucs/debug/memtrack_int.h>
+#include <ucs/sys/compiler_def.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
-// configuration fields go here such as device paths
 static ucs_config_field_t uct_cxl_md_config_table[] = {
         {"", "", NULL, ucs_offsetof(uct_cxl_md_config_t, super),
          UCS_CONFIG_TYPE_TABLE(uct_md_config_table)},
 
-        {NULL}};
+        {"ACCEL_DEV", "/dev/cxl_accel0",
+         "Character device whose mapping forwards accesses to the peer",
+         ucs_offsetof(uct_cxl_md_config_t, accel_dev_path),
+         UCS_CONFIG_TYPE_STRING},
 
-ucs_status_t uct_cxl_md_open(uct_component_t *component, const char *md_name,
-                             const uct_md_config_t *config, uct_md_h *md_p)
-{
-    /* opens the device node, mmap()s it with uncached/device attributes, fills 
-  * in aperture_base/aperture_size, sets rma_next_offset = UCT_CXL_RMA_OFFSET
-  */
-    // TODO: REALLY needs to be implemented; this will only allow linking, not any device usage
-    return UCS_ERR_UNSUPPORTED;
-}
+        {"LOCAL_DEV", "/dev/cxl_accel_local0",
+         "Character device whose mapping exposes local backing memory, i.e. "
+         "what the peer writes into",
+         ucs_offsetof(uct_cxl_md_config_t, local_dev_path),
+         UCS_CONFIG_TYPE_STRING},
+
+        {"APERTURE_SIZE", "256M",
+         "Size of the CXL window; must match the device's HDM region size",
+         ucs_offsetof(uct_cxl_md_config_t, aperture_size),
+         UCS_CONFIG_TYPE_MEMUNITS},
+
+        {NULL}};
 
 // Below functions are currently replaced ucs_empty_function_return_unsupported,
 // though they may be need to be implemented beyond linking
@@ -55,8 +66,16 @@ static ucs_status_t uct_cxl_md_query(uct_md_h md, uct_md_attr_v2_t *attr)
 }
 
 
+static void uct_cxl_md_close(uct_md_h uct_md)
+{
+    uct_cxl_md_t *md = ucs_derived_of(uct_md, uct_cxl_md_t);
+
+    munmap(md->aperture_base, md->aperture_size);
+    ucs_free(md);
+}
+
 uct_md_ops_t uct_cxl_md_ops = {
-        .close = (uct_md_close_func_t)ucs_empty_function,
+        .close = uct_cxl_md_close,
         .query = uct_cxl_md_query, /* needs a real minimal body, see below */
         .mem_alloc = (uct_md_mem_alloc_func_t)
                 ucs_empty_function_return_unsupported,
@@ -75,6 +94,62 @@ uct_md_ops_t uct_cxl_md_ops = {
                 ucs_empty_function_return_unsupported,
         .detect_memory_type = (uct_md_detect_memory_type_func_t)
                 ucs_empty_function_return_unsupported};
+
+static ucs_status_t
+uct_cxl_md_open(uct_component_t *component, const char *md_name,
+                const uct_md_config_t *uct_config, uct_md_h *md_p)
+{
+    const uct_cxl_md_config_t *config = ucs_derived_of(uct_config,
+                                                       uct_cxl_md_config_t);
+    uct_cxl_md_t *md;
+    ucs_status_t status;
+    void *base;
+    int fd;
+
+    if (config->aperture_size <= UCT_CXL_RMA_OFFSET) {
+        ucs_error("cxl: aperture size %zu is too small for the control block "
+                  "and FIFO (need more than %zu bytes)",
+                  config->aperture_size, (size_t)UCT_CXL_RMA_OFFSET);
+        return UCS_ERR_INVALID_PARAM;
+    }
+
+    md = ucs_calloc(1, sizeof(*md), "uct_cxl_md");
+    if (md == NULL) {
+        return UCS_ERR_NO_MEMORY;
+    }
+
+    fd = open(config->accel_dev_path, O_RDWR | O_CLOEXEC);
+    if (fd < 0) {
+        ucs_debug("cxl: failed to open %s: %m", config->accel_dev_path);
+        status = UCS_ERR_NO_DEVICE;
+        goto err_free;
+    }
+
+    /* The driver installs uncached/device PTEs, so every access traps to the
+     * peer. The mapping stays valid after the descriptor is closed. */
+    base = mmap(NULL, config->aperture_size, PROT_READ | PROT_WRITE, MAP_SHARED,
+                fd, 0);
+    close(fd);
+    if (base == MAP_FAILED) {
+        ucs_error("cxl: failed to mmap %zu bytes of %s: %m",
+                  config->aperture_size, config->accel_dev_path);
+        status = UCS_ERR_IO_ERROR;
+        goto err_free;
+    }
+
+    md->super.ops       = &uct_cxl_md_ops;
+    md->super.component = component;
+    md->aperture_base   = base;
+    md->aperture_size   = config->aperture_size;
+    md->rma_next_offset = UCT_CXL_RMA_OFFSET;
+
+    *md_p = &md->super;
+    return UCS_OK;
+
+err_free:
+    ucs_free(md);
+    return status;
+}
 
 uct_component_t uct_cxl_component = {
         .query_md_resources = uct_md_query_single_md_resource,

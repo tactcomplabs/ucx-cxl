@@ -45,6 +45,8 @@ struct uct_cxl_md {
     uct_md_t super;
     void *aperture_base; /* mmap'd VA of the CXL BAR */
     void *local_base; /* mmap'd VA of the local CXL BAR */
+    int aperture_fd;
+    int local_fd; /* Holds the exclusive flock() on the local device */
     size_t aperture_size; /* discovered/configured window size */
     ucs_spinlock_t lock; /* Protects free_list */
     /* Free uct_cxl_seg_t ranges of the RMA region, sorted by offset, with no

@@ -4,9 +4,12 @@
 #include <ucs/debug/log.h>
 #include <ucs/debug/memtrack_int.h>
 #include <ucs/sys/compiler_def.h>
+#include <errno.h>
 #include <fcntl.h>
+#include <sys/file.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <stdbool.h>
 
 static ucs_config_field_t uct_cxl_md_config_table[] = {
         {"", "", NULL, ucs_offsetof(uct_cxl_md_config_t, super),
@@ -210,6 +213,62 @@ static ucs_status_t uct_cxl_md_query(uct_md_h md, uct_md_attr_v2_t *attr)
     return UCS_OK;
 }
 
+static void uct_cxl_md_unmap_device(void *address, size_t length, int fd)
+{
+    munmap(address, length);
+    close(fd);
+}
+
+/* With 'exclusive', take a non-blocking exclusive flock() on the device. It is
+ * held for as long as fd stays open, so the caller must keep fd open for the
+ * lifetime of the mapping. */
+static ucs_status_t uct_cxl_md_map_device(const char *file_name, size_t length,
+                                          bool exclusive, void **address_p,
+                                          int *fd_p)
+{
+    ucs_status_t status;
+    void *address;
+    int fd;
+
+    fd = open(file_name, O_RDWR | O_CLOEXEC);
+    if (fd < 0) {
+        ucs_debug("cxl: failed to open %s: %m", file_name);
+        return UCS_ERR_NO_DEVICE;
+    }
+
+    if (exclusive && (flock(fd, LOCK_EX | LOCK_NB) != 0)) {
+        if (errno == EWOULDBLOCK) {
+            /* UCP skips an MD that fails to open without logging, so say why
+             * the transport disappeared */
+            ucs_error("cxl: %s is in use by another UCX memory domain (in "
+                      "this or another process); only one may own it",
+                      file_name);
+            status = UCS_ERR_BUSY;
+        } else {
+            ucs_error("cxl: failed to lock %s: %m", file_name);
+            status = UCS_ERR_IO_ERROR;
+        }
+        goto err_close;
+    }
+
+    /* The driver installs uncached/device PTEs, so accesses are not cached or
+     * merged (and on the peer window, every access traps to the peer) */
+    address = mmap(NULL, length, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (address == MAP_FAILED) {
+        ucs_error("cxl: failed to mmap %zu bytes of %s: %m", length, file_name);
+        status = UCS_ERR_IO_ERROR;
+        goto err_close;
+    }
+
+    *address_p = address;
+    *fd_p      = fd;
+    return UCS_OK;
+
+err_close:
+    close(fd);
+    return status;
+}
+
 /* Deallocate all free memory regions in the RMA range */
 static void uct_cxl_md_free_list_cleanup(uct_cxl_md_t *md)
 {
@@ -235,8 +294,9 @@ static void uct_cxl_md_close(uct_md_h uct_md)
 
     uct_cxl_md_free_list_cleanup(md);
     ucs_spinlock_destroy(&md->lock);
-    munmap(md->local_base, md->aperture_size);
-    munmap(md->aperture_base, md->aperture_size);
+    uct_cxl_md_unmap_device(md->local_base, md->aperture_size, md->local_fd);
+    uct_cxl_md_unmap_device(md->aperture_base, md->aperture_size,
+                            md->aperture_fd);
     ucs_free(md);
 }
 
@@ -258,32 +318,6 @@ uct_md_ops_t uct_cxl_md_ops = {
                 ucs_empty_function_return_unsupported,
         .detect_memory_type = (uct_md_detect_memory_type_func_t)
                 ucs_empty_function_return_unsupported};
-
-static ucs_status_t
-uct_cxl_md_map_device(const char *file_name, size_t length, void **address_p)
-{
-    void *address;
-    int fd;
-
-    fd = open(file_name, O_RDWR | O_CLOEXEC);
-    if (fd < 0) {
-        ucs_debug("cxl: failed to open %s: %m", file_name);
-        return UCS_ERR_NO_DEVICE;
-    }
-
-    /* The driver installs uncached/device PTEs, so accesses are not cached or
-     * merged (and on the peer window, every access traps to the peer). The
-     * mapping stays valid after the descriptor is closed. */
-    address = mmap(NULL, length, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    close(fd);
-    if (address == MAP_FAILED) {
-        ucs_error("cxl: failed to mmap %zu bytes of %s: %m", length, file_name);
-        return UCS_ERR_IO_ERROR;
-    }
-
-    *address_p = address;
-    return UCS_OK;
-}
 
 static ucs_status_t
 uct_cxl_md_open(uct_component_t *component, const char *md_name,
@@ -310,13 +344,16 @@ uct_cxl_md_open(uct_component_t *component, const char *md_name,
     }
 
     status = uct_cxl_md_map_device(config->accel_dev_path,
-                                   config->aperture_size, &md->aperture_base);
+                                   config->aperture_size, false,
+                                   &md->aperture_base, &md->aperture_fd);
     if (status != UCS_OK) {
         goto err_free_md;
     }
 
+    /* The free list assumes it is the only allocator of the local memdev */
     status = uct_cxl_md_map_device(config->local_dev_path,
-                                   config->aperture_size, &md->local_base);
+                                   config->aperture_size, true, &md->local_base,
+                                   &md->local_fd);
     if (status != UCS_OK) {
         goto err_unmap_aperture;
     }
@@ -350,9 +387,11 @@ uct_cxl_md_open(uct_component_t *component, const char *md_name,
 err_destroy_lock:
     ucs_spinlock_destroy(&md->lock);
 err_unmap_local:
-    munmap(md->local_base, config->aperture_size);
+    uct_cxl_md_unmap_device(md->local_base, config->aperture_size,
+                            md->local_fd);
 err_unmap_aperture:
-    munmap(md->aperture_base, config->aperture_size);
+    uct_cxl_md_unmap_device(md->aperture_base, config->aperture_size,
+                            md->aperture_fd);
 err_free_md:
     ucs_free(md);
     return status;

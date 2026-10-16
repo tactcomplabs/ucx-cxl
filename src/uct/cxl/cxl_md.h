@@ -3,6 +3,8 @@
 
 #include <uct/base/uct_md.h>
 #include <ucs/config/types.h>
+#include <ucs/datastruct/list.h>
+#include <ucs/type/spinlock.h>
 #include <ucs/type/status.h>
 #include "cxl_iface.h"
 
@@ -16,18 +18,38 @@
 #define UCT_CXL_FIFO_SIZE   (UCT_CXL_FIFO_ELEM_SIZE * UCT_CXL_FIFO_DEPTH)
 
 #define UCT_CXL_RMA_OFFSET (UCT_CXL_FIFO_OFFSET + UCT_CXL_FIFO_SIZE)
-/* [UCT_CXL_RMA_OFFSET, aperture_size) is bump-allocated for mem_alloc/mem_reg */
+/* [UCT_CXL_RMA_OFFSET, aperture_size) of the *local* memdev is handed out by
+ * mem_alloc. Each guest owns its own memdev's RMA region, so the two peers'
+ * allocators never need to coordinate. */
+
+/* Granularity of RMA region allocations, both offset and length */
+#define UCT_CXL_SEG_ALIGN UCS_SYS_CACHE_LINE_SIZE
+
 
 typedef struct uct_cxl_packed_rkey {
     uint64_t offset;
     size_t length;
 } UCS_S_PACKED uct_cxl_packed_rkey_t;
 
+
+/* A range of the local RMA region. Returned by mem_alloc as the memh. If
+ * linked on uct_cxl_md_t::free_list, it describes a free range instead. */
+typedef struct uct_cxl_seg {
+    ucs_list_link_t list; /* Entry in free_list, unused while allocated */
+    uint64_t offset; /* From the start of the memdev */
+    size_t length;
+} uct_cxl_seg_t;
+
+
 struct uct_cxl_md {
     uct_md_t super;
     void *aperture_base; /* mmap'd VA of the CXL BAR */
+    void *local_base; /* mmap'd VA of the local CXL BAR */
     size_t aperture_size; /* discovered/configured window size */
-    size_t rma_next_offset; /* bump allocator cursor, starts at UCT_CXL_RMA_OFFSET */
+    ucs_spinlock_t lock; /* Protects free_list */
+    /* Free uct_cxl_seg_t ranges of the RMA region, sorted by offset, with no
+     * two adjacent ranges (consolidated on free)*/
+    ucs_list_link_t free_list;
 };
 
 typedef struct uct_cxl_md_config {

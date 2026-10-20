@@ -1,6 +1,5 @@
 #include <uct/base/uct_component.h>
 #include <uct/sm/base/sm_md.h>
-#include "cxl_md.h"
 #include <ucs/debug/log.h>
 #include <ucs/debug/memtrack_int.h>
 #include <ucs/sys/compiler_def.h>
@@ -10,6 +9,8 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #include <stdbool.h>
+#include <inttypes.h>
+#include "cxl_md.h"
 
 static ucs_config_field_t uct_cxl_md_config_table[] = {
         {"", "", NULL, ucs_offsetof(uct_cxl_md_config_t, super),
@@ -33,18 +34,11 @@ static ucs_config_field_t uct_cxl_md_config_table[] = {
 
         {NULL}};
 
-// Below functions are currently replaced ucs_empty_function_return_unsupported,
-// though they may be need to be implemented beyond linking
-/*
-void uct_cxl_mem_reg() {}
-void uct_cxl_mem_dereg() {}
-*/
-
 /* Get RMA region size, potentially rounding down to satisfy alignment requirements */
 static size_t uct_cxl_md_rma_size(size_t aperture_size)
 {
-    UCS_STATIC_ASSERT((UCT_CXL_RMA_OFFSET % UCT_CXL_SEG_ALIGN) == 0);
-    return ucs_align_down_pow2(aperture_size, UCT_CXL_SEG_ALIGN) -
+    UCS_STATIC_ASSERT((UCT_CXL_RMA_OFFSET % UCT_CXL_ALIGN) == 0);
+    return ucs_align_down_pow2(aperture_size, UCT_CXL_ALIGN) -
            UCT_CXL_RMA_OFFSET;
 }
 
@@ -80,7 +74,7 @@ uct_cxl_mem_alloc(uct_md_h tl_md, size_t *length_p, void **address_p,
         return UCS_ERR_NO_MEMORY;
     }
 
-    length = ucs_align_up_pow2(*length_p, UCT_CXL_SEG_ALIGN);
+    length = ucs_align_up_pow2(*length_p, UCT_CXL_ALIGN);
 
     /* Allocated before taking the lock, so that running out of host memory is
      * the only failure that is not "the RMA region is full" */
@@ -381,11 +375,18 @@ uct_cxl_md_open(uct_component_t *component, const char *md_name,
     uct_cxl_md_t *md;
     ucs_status_t status;
 
-    if (config->aperture_size < UCT_CXL_RMA_OFFSET + UCT_CXL_SEG_ALIGN) {
+    /* Unrelated to opening, but UCS_STATIC_ASSERT needs function scope */
+    UCS_STATIC_ASSERT(sizeof(uct_cxl_fifo_elem_t) == UCT_CXL_FIFO_ELEM_SIZE);
+    UCS_STATIC_ASSERT(ucs_offsetof(uct_cxl_fifo_elem_t, seq) == 0);
+    UCS_STATIC_ASSERT((ucs_offsetof(uct_cxl_fifo_elem_t, payload) % 8) == 0);
+    UCS_STATIC_ASSERT((ucs_offsetof(uct_cxl_fifo_ctl_t, ack) % 8) == 0);
+    UCS_STATIC_ASSERT((UCT_CXL_FIFO_OFFSET % UCT_CXL_ALIGN) == 0);
+
+    if (config->aperture_size < UCT_CXL_RMA_OFFSET + UCT_CXL_ALIGN) {
         ucs_error("cxl: aperture size %zu is too small for the control block, "
                   "FIFO and RMA region (need at least %zu bytes)",
                   config->aperture_size,
-                  (size_t)(UCT_CXL_RMA_OFFSET + UCT_CXL_SEG_ALIGN));
+                  (size_t)(UCT_CXL_RMA_OFFSET + UCT_CXL_ALIGN));
         return UCS_ERR_INVALID_PARAM;
     }
 

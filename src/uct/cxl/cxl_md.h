@@ -1,34 +1,40 @@
 #ifndef UCT_CXL_MD_H_
 #define UCT_CXL_MD_H_
 
+#include <ucs/sys/compiler_def.h>
 #include <uct/base/uct_md.h>
 #include <ucs/config/types.h>
 #include <ucs/datastruct/list.h>
 #include <ucs/type/spinlock.h>
 #include <ucs/type/status.h>
-#include "cxl_iface.h"
+#include <ucs/sys/ptr_arith.h>
+
+/* Alignment to be used for entire aperature window */
+#define UCT_CXL_ALIGN 64
 
 /* Fixed partition of the CXL aperture - identical on both peers, compiled in,
  * not negotiated at runtime */
 #define UCT_CXL_CTRL_OFFSET 0
 #define UCT_CXL_CTRL_SIZE                                                      \
-    ucs_align_up(sizeof(uct_cxl_fifo_ctl_t), UCS_SYS_CACHE_LINE_SIZE)
+    ucs_align_up(sizeof(uct_cxl_fifo_ctl_t), UCT_CXL_ALIGN)
 
-#define UCT_CXL_FIFO_OFFSET (UCT_CXL_CTRL_OFFSET + UCT_CXL_CTRL_SIZE)
-#define UCT_CXL_FIFO_SIZE   (UCT_CXL_FIFO_ELEM_SIZE * UCT_CXL_FIFO_DEPTH)
+/* FIFO parameters */
+#define UCT_CXL_FIFO_ELEM_SIZE 256
+#define UCT_CXL_FIFO_DEPTH     64
+#define UCT_CXL_FIFO_OFFSET    (UCT_CXL_CTRL_OFFSET + UCT_CXL_CTRL_SIZE)
+#define UCT_CXL_FIFO_SIZE      (UCT_CXL_FIFO_ELEM_SIZE * UCT_CXL_FIFO_DEPTH)
 
-#define UCT_CXL_RMA_OFFSET (UCT_CXL_FIFO_OFFSET + UCT_CXL_FIFO_SIZE)
 /* [UCT_CXL_RMA_OFFSET, aperture_size) of the *local* memdev is handed out by
  * mem_alloc. Each guest owns its own memdev's RMA region, so the two peers'
  * allocators never need to coordinate. */
+#define UCT_CXL_RMA_OFFSET (UCT_CXL_FIFO_OFFSET + UCT_CXL_FIFO_SIZE)
 
-/* Granularity of RMA region allocations, both offset and length */
-#define UCT_CXL_SEG_ALIGN UCS_SYS_CACHE_LINE_SIZE
-
+#define UCT_CXL_MAGIC 1234ULL
 
 typedef struct uct_cxl_packed_rkey {
-    uint64_t offset;
-    size_t length;
+    uint64_t seg_offset;
+    uint64_t seg_addr;
+    uint64_t length;
 } UCS_S_PACKED uct_cxl_packed_rkey_t;
 
 
@@ -41,7 +47,22 @@ typedef struct uct_cxl_seg {
 } uct_cxl_seg_t;
 
 
-struct uct_cxl_md {
+typedef struct uct_cxl_fifo_ctl {
+    uint64_t magic; /* owner, at init */
+    uint64_t iface_id; /* owner, at init; peer reads in is_reachable */
+    uint64_t ack[UCT_CXL_FIFO_DEPTH]; /* PEER writes ack[i] = seq it consumed
+                                          from slot i of OWNER's tx stream */
+} uct_cxl_fifo_ctl_t;
+
+typedef struct uct_cxl_fifo_elem {
+    uint64_t seq; /* written last; valid iff == consumer index + 1 */
+    uint32_t length;
+    uint8_t am_id;
+    uint8_t reserved[3]; /* padding (unused) */
+    uint8_t payload[UCT_CXL_FIFO_ELEM_SIZE - 16];
+} UCS_S_PACKED uct_cxl_fifo_elem_t;
+
+typedef struct uct_cxl_md {
     uct_md_t super;
     void *aperture_base; /* mmap'd VA of the CXL BAR */
     void *local_base; /* mmap'd VA of the local CXL BAR */
@@ -52,7 +73,7 @@ struct uct_cxl_md {
     /* Free uct_cxl_seg_t ranges of the RMA region, sorted by offset, with no
      * two adjacent ranges (consolidated on free)*/
     ucs_list_link_t free_list;
-};
+} uct_cxl_md_t;
 
 typedef struct uct_cxl_md_config {
     uct_md_config_t super;

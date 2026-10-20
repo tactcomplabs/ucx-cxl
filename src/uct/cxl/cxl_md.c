@@ -188,6 +188,58 @@ static ucs_status_t uct_cxl_mem_free(uct_md_h tl_md, uct_mem_h memh)
     return UCS_OK;
 }
 
+/* Only memory inside the local RMA region can be reached by the peer, so this
+ * is for direct UCT users registering (part of) a mem_alloc buffer. The MD does
+ * not advertise UCT_MD_FLAG_REG, so UCP never calls it. Whether the range is
+ * actually allocated is not checked. */
+static ucs_status_t
+uct_cxl_mem_reg(uct_md_h tl_md, void *address, size_t length,
+                const uct_md_mem_reg_params_t *params, uct_mem_h *memh_p)
+{
+    uct_cxl_md_t *md = ucs_derived_of(tl_md, uct_cxl_md_t);
+    uint64_t flags  = UCT_MD_MEM_REG_FIELD_VALUE(params, flags, FIELD_FLAGS, 0);
+    void *rma_start = UCS_PTR_BYTE_OFFSET(md->local_base, UCT_CXL_RMA_OFFSET);
+    size_t rma_size = uct_cxl_md_rma_size(md->aperture_size);
+    uct_cxl_seg_t *seg;
+    size_t rma_offset;
+
+    /* Don't allow the control or FIFO regions to be registered 
+     * (otherwise peer could overwrite) */
+    rma_offset = UCS_PTR_BYTE_DIFF(rma_start, address);
+    if ((address < rma_start) || (rma_offset >= rma_size) ||
+        (length > rma_size - rma_offset)) {
+        uct_md_log_mem_reg_error(flags,
+                                 "cxl: cannot register %p..%p, outside the RMA "
+                                 "region %p..%p",
+                                 address, UCS_PTR_BYTE_OFFSET(address, length),
+                                 rma_start,
+                                 UCS_PTR_BYTE_OFFSET(rma_start, rma_size));
+        return UCS_ERR_UNSUPPORTED;
+    }
+
+    seg = ucs_malloc(sizeof(*seg), "uct_cxl_seg");
+    if (seg == NULL) {
+        uct_md_log_mem_reg_error(flags,
+                                 "cxl: failed to allocate segment descriptor");
+        return UCS_ERR_NO_MEMORY;
+    }
+
+    seg->offset = UCT_CXL_RMA_OFFSET + rma_offset;
+    seg->length = length;
+
+    *memh_p = seg;
+    return UCS_OK;
+}
+
+static ucs_status_t
+uct_cxl_mem_dereg(uct_md_h tl_md, const uct_md_mem_dereg_params_t *params)
+{
+    UCT_MD_MEM_DEREG_CHECK_PARAMS(params, 0);
+
+    ucs_free(params->memh);
+    return UCS_OK;
+}
+
 ucs_status_t
 uct_cxl_mkey_pack(uct_md_h md, uct_mem_h memh, void *address, size_t length,
                   const uct_md_mkey_pack_params_t *params, void *mkey_buffer)
@@ -208,7 +260,8 @@ static ucs_status_t uct_cxl_rkey_unpack(uct_component_t *component,
 static ucs_status_t uct_cxl_md_query(uct_md_h md, uct_md_attr_v2_t *attr)
 {
     uct_md_base_md_query(attr);
-    attr->reg_mem_types    = UCS_BIT(UCS_MEMORY_TYPE_HOST);
+    /* No UCT_MD_FLAG_REG: mem_reg rejects almost all host memory, and UCP fails
+     * a whole registration when any REG-capable MD rejects the buffer */
     attr->access_mem_types = UCS_BIT(UCS_MEMORY_TYPE_HOST);
     return UCS_OK;
 }
@@ -307,9 +360,8 @@ uct_md_ops_t uct_cxl_md_ops = {
         .mem_free   = uct_cxl_mem_free,
         .mem_advise = (uct_md_mem_advise_func_t)
                 ucs_empty_function_return_unsupported,
-        .mem_reg =
-                uct_md_dummy_mem_reg, /* existing helper, same as self/posix */
-        .mem_dereg = uct_md_dummy_mem_dereg, /* existing helper */
+        .mem_reg   = uct_cxl_mem_reg,
+        .mem_dereg = uct_cxl_mem_dereg,
         .mem_query = (uct_md_mem_query_func_t)
                 ucs_empty_function_return_unsupported,
         .mkey_pack =

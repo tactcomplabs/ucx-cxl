@@ -46,8 +46,12 @@ uct_cxl_iface_query(uct_iface_h tl_iface, uct_iface_attr_t *iface_attr)
     iface_attr->max_conn_priv     = 0;
     iface_attr->cap.put.max_bcopy = UCT_CXL_RMA_MAX_BCOPY;
     iface_attr->cap.get.max_bcopy = UCT_CXL_RMA_MAX_BCOPY;
-    iface_attr->cap.am.max_short  = UCT_CXL_FIFO_ELEM_SIZE - 16 - 8;
-    iface_attr->cap.am.max_bcopy  = UCT_CXL_FIFO_ELEM_SIZE - 16;
+    /* am_short carries its 8-byte header inside the payload */
+    iface_attr->cap.am.max_short  = ucs_field_sizeof(uct_cxl_fifo_elem_t,
+                                                     payload) -
+                                   sizeof(uint64_t);
+    iface_attr->cap.am.max_bcopy  = ucs_field_sizeof(uct_cxl_fifo_elem_t,
+                                                     payload);
     iface_attr->cap.am.max_iov    = 1;
 
     iface_attr->latency             = UCT_CXL_IFACE_LATENCY;
@@ -158,16 +162,16 @@ static UCS_CLASS_INIT_FUNC(uct_cxl_iface_t, uct_md_h md, uct_worker_h worker,
         return UCS_ERR_BUSY;
     }
 
-    self->md            = cxl_md;
-    self->tx.fifo       = UCS_PTR_BYTE_OFFSET(cxl_md->aperture_base,
-                                              UCT_CXL_FIFO_OFFSET);
-    self->rx.fifo       = UCS_PTR_BYTE_OFFSET(cxl_md->local_base,
-                                              UCT_CXL_FIFO_OFFSET);
-    self->local_ctrl    = UCS_PTR_BYTE_OFFSET(cxl_md->local_base,
-                                              UCT_CXL_CTRL_OFFSET);
-    self->aperture_ctrl = UCS_PTR_BYTE_OFFSET(cxl_md->aperture_base,
-                                              UCT_CXL_CTRL_OFFSET);
-    self->tx.head       = 0;
+    self->md          = cxl_md;
+    self->tx.fifo     = UCS_PTR_BYTE_OFFSET(cxl_md->aperture_base,
+                                            UCT_CXL_FIFO_OFFSET);
+    self->rx.fifo     = UCS_PTR_BYTE_OFFSET(cxl_md->local_base,
+                                            UCT_CXL_FIFO_OFFSET);
+    self->local_ctrl  = UCS_PTR_BYTE_OFFSET(cxl_md->local_base,
+                                            UCT_CXL_CTRL_OFFSET);
+    self->remote_ctrl = UCS_PTR_BYTE_OFFSET(cxl_md->aperture_base,
+                                            UCT_CXL_CTRL_OFFSET);
+    self->tx.head     = 0;
     ucs_queue_head_init(&self->tx.pending);
     self->rx.tail = 0;
 

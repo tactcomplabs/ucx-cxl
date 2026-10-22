@@ -17,7 +17,6 @@
 #elif defined(__x86_64__)
 #define uct_cxl_fence() asm volatile("mfence" ::: "memory")
 #else
-#include <stdatomic.h>
 #define uct_cxl_fence() __atomic_thread_fence(__ATOMIC_SEQ_CST) /* revisit */
 #endif
 

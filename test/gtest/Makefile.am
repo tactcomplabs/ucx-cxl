@@ -219,6 +219,11 @@ gtest_SOURCES = \
 	ucs/test_vfs.cc \
 	ucs/arch/test_x86_64.cc
 
+if HAVE_CXL
+gtest_SOURCES += \
+	uct/cxl/test_cxl_io.cc
+endif
+
 if HAVE_IB
 gtest_SOURCES += \
 	uct/ib/test_ib.cc \

@@ -16,7 +16,8 @@ libuct_cxl_la_LDFLAGS  = -version-info $(SOVERSION) $(UCT_MODULE_LDFLAGS) \
 noinst_HEADERS = \
 	cxl_ep.h \
 	cxl_iface.h \
-	cxl_md.h
+	cxl_md.h \
+	cxl_io.h
 
 libuct_cxl_la_SOURCES = \
 	cxl_ep.c \

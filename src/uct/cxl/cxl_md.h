@@ -9,7 +9,10 @@
 #include <ucs/type/status.h>
 #include <ucs/sys/ptr_arith.h>
 
-/* Alignment to be used for entire aperature window */
+/* 
+ * Alignment to be used for entire aperature window. Equivalent to UCS_SYS_CACHE_LINE_SIZE
+ * for x86/RV64 platforms, but hardcode here to make offsets arch-agnostic
+*/
 #define UCT_CXL_ALIGN 64
 
 /* Fixed partition of the CXL aperture - identical on both peers, compiled in,

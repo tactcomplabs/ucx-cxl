@@ -1,6 +1,9 @@
+#include <ucs/sys/sys.h>
 #include "cxl_iface.h"
 #include "cxl_ep.h"
 #include "cxl_md.h"
+#include "cxl_io.h"
+#include <string.h>
 
 static ucs_config_field_t uct_cxl_iface_config_table[] = {
         {"", "", NULL, ucs_offsetof(uct_cxl_iface_config_t, super),
@@ -13,14 +16,12 @@ uct_cxl_iface_query_tl_devices(uct_md_h md,
                                uct_tl_device_resource_t **tl_devices_p,
                                unsigned *num_tl_devices_p)
 {
-    // TODO: good enough for linking but currently precludes actually opening the
-    // iface
-    *tl_devices_p     = NULL;
-    *num_tl_devices_p = 0;
-    return UCS_OK;
+    return uct_single_device_resource(md, "cxl0", UCT_DEVICE_TYPE_SHM,
+                                      UCS_SYS_DEVICE_ID_UNKNOWN, tl_devices_p,
+                                      num_tl_devices_p);
 }
 
-// busy-poll fifo_ctl->tail's slot owner bit, dispatch via
+// busy-poll fifo_ctl->tail's slot seq, dispatch via
 // uct_iface_invoke_am(), advance tail. This is the direct analog of
 // mm_iface.c's FIFO poll loop
 static unsigned uct_cxl_iface_progress(uct_iface_h iface)
@@ -28,8 +29,6 @@ static unsigned uct_cxl_iface_progress(uct_iface_h iface)
     return 0;
 }
 
-// TODO: fills uct_iface_attr_t with the capability flags (PUT/GET bcopy, AM
-// short/bcopy; leave zcopy and atomics unset)
 static ucs_status_t
 uct_cxl_iface_query(uct_iface_h tl_iface, uct_iface_attr_t *iface_attr)
 {
@@ -38,12 +37,24 @@ uct_cxl_iface_query(uct_iface_h tl_iface, uct_iface_attr_t *iface_attr)
     uct_base_iface_query(&iface->super, iface_attr);
     iface_attr->cap.flags = UCT_IFACE_FLAG_PUT_BCOPY |
                             UCT_IFACE_FLAG_GET_BCOPY | UCT_IFACE_FLAG_AM_SHORT |
-                            UCT_IFACE_FLAG_AM_BCOPY | UCT_IFACE_FLAG_PENDING;
-    iface_attr->iface_addr_len  = sizeof(uct_cxl_iface_addr_t);
-    iface_attr->device_addr_len = 0;
-    iface_attr->ep_addr_len     = 0;
-    iface_attr->cap.put.max_bcopy =
-            UCT_CXL_FIFO_ELEM_SIZE; /* placeholder sizing */
+                            UCT_IFACE_FLAG_AM_BCOPY | UCT_IFACE_FLAG_PENDING |
+                            UCT_IFACE_FLAG_CB_SYNC |
+                            UCT_IFACE_FLAG_CONNECT_TO_IFACE;
+    iface_attr->iface_addr_len    = sizeof(uct_cxl_iface_addr_t);
+    iface_attr->device_addr_len   = 0;
+    iface_attr->ep_addr_len       = 0;
+    iface_attr->max_conn_priv     = 0;
+    iface_attr->cap.put.max_bcopy = UCT_CXL_RMA_MAX_BCOPY;
+    iface_attr->cap.get.max_bcopy = UCT_CXL_RMA_MAX_BCOPY;
+    iface_attr->cap.am.max_short  = UCT_CXL_FIFO_ELEM_SIZE - 16 - 8;
+    iface_attr->cap.am.max_bcopy  = UCT_CXL_FIFO_ELEM_SIZE - 16;
+    iface_attr->cap.am.max_iov    = 1;
+
+    iface_attr->latency             = UCT_CXL_IFACE_LATENCY;
+    iface_attr->bandwidth.dedicated = UCT_CXL_IFACE_BANDWIDTH_DEDICATED;
+    iface_attr->bandwidth.shared    = UCT_CXL_IFACE_BANDWIDTH_SHARED;
+    iface_attr->overhead            = UCT_CXL_IFACE_OVERHEAD;
+    iface_attr->priority            = 0;
     return UCS_OK;
 }
 
@@ -51,17 +62,15 @@ static int
 uct_cxl_iface_is_reachable_v2(const uct_iface_h tl_iface,
                               const uct_iface_is_reachable_params_t *params)
 {
-    // seems to be the correct return for reachable interface
-    // TODO: implement the actual checking mechanisms after everything
-    // is wired up
+    /* TODO: (Track A) check magic and iface_id */
     return 1;
 }
 
 static ucs_status_t
 uct_cxl_iface_get_address(uct_iface_h tl_iface, uct_iface_addr_t *addr)
 {
-    // TODO: currently just a placeholder
-    *(uct_cxl_iface_addr_t *)addr = 0; /* or a real per-iface id */
+    uct_cxl_iface_t *iface        = ucs_derived_of(tl_iface, uct_cxl_iface_t);
+    *(uct_cxl_iface_addr_t *)addr = iface->id;
     return UCS_OK;
 }
 
@@ -114,10 +123,8 @@ static uct_iface_ops_t uct_cxl_iface_ops = {
         .ep_destroy       = UCS_CLASS_DELETE_FUNC_NAME(uct_cxl_ep_t),
         .iface_flush      = uct_base_iface_flush,
         .iface_fence      = uct_base_iface_fence,
-        .iface_progress_enable = (uct_iface_progress_enable_func_t)
-                ucs_empty_function,
-        .iface_progress_disable = (uct_iface_progress_disable_func_t)
-                ucs_empty_function,
+        .iface_progress_enable    = uct_base_iface_progress_enable,
+        .iface_progress_disable   = uct_base_iface_progress_disable,
         .iface_progress           = uct_cxl_iface_progress,
         .iface_close              = UCS_CLASS_DELETE_FUNC_NAME(uct_cxl_iface_t),
         .iface_query              = uct_cxl_iface_query,
@@ -126,14 +133,12 @@ static uct_iface_ops_t uct_cxl_iface_ops = {
         .iface_get_address  = uct_cxl_iface_get_address,
         .iface_is_reachable = uct_base_iface_is_reachable};
 
-// TODO: any other parameters? Needs md pointer?
-// computes iface->fifo_ctl = md->aperture_base + UCT_CXL_CTRL_OFFSET, zeroes
-// head/tail on the owning side
 static UCS_CLASS_INIT_FUNC(uct_cxl_iface_t, uct_md_h md, uct_worker_h worker,
                            const uct_iface_params_t *params,
                            const uct_iface_config_t *tl_config)
 {
-    // do we want some UCS_STATS_ARG in this? What args would we want here?
+    uct_cxl_md_t *cxl_md = ucs_derived_of(md, uct_cxl_md_t);
+    int in_use;
     UCS_CLASS_CALL_SUPER_INIT(uct_base_iface_t, &uct_cxl_iface_ops,
                               &uct_cxl_iface_internal_ops, md, worker, params,
                               tl_config UCS_STATS_ARG(
@@ -142,16 +147,64 @@ static UCS_CLASS_INIT_FUNC(uct_cxl_iface_t, uct_md_h md, uct_worker_h worker,
                                               params->stats_root :
                                               NULL) UCS_STATS_ARG("cxl"));
 
-    self->md       = ucs_derived_of(md, uct_cxl_md_t);
-    self->fifo_ctl = UCS_PTR_BYTE_OFFSET(self->md->aperture_base,
-                                         UCT_CXL_CTRL_OFFSET);
-    self->fifo     = UCS_PTR_BYTE_OFFSET(self->md->aperture_base,
-                                         UCT_CXL_FIFO_OFFSET);
+    ucs_spin_lock(&cxl_md->lock);
+    in_use               = cxl_md->iface_in_use;
+    cxl_md->iface_in_use = 1;
+    ucs_spin_unlock(&cxl_md->lock);
+    if (in_use) {
+        ucs_error("cxl: md %p already has an open interface, only one is "
+                  "supported per process",
+                  cxl_md);
+        return UCS_ERR_BUSY;
+    }
+
+    self->md            = cxl_md;
+    self->tx.fifo       = UCS_PTR_BYTE_OFFSET(cxl_md->aperture_base,
+                                              UCT_CXL_FIFO_OFFSET);
+    self->rx.fifo       = UCS_PTR_BYTE_OFFSET(cxl_md->local_base,
+                                              UCT_CXL_FIFO_OFFSET);
+    self->local_ctrl    = UCS_PTR_BYTE_OFFSET(cxl_md->local_base,
+                                              UCT_CXL_CTRL_OFFSET);
+    self->aperture_ctrl = UCS_PTR_BYTE_OFFSET(cxl_md->aperture_base,
+                                              UCT_CXL_CTRL_OFFSET);
+    self->tx.head       = 0;
+    ucs_queue_head_init(&self->tx.pending);
+    self->rx.tail = 0;
+
+    // Generate unique id for the iface, so it can be correctly
+    // identified and loopback is avoided. Avoid troublesome edge
+    // cases
+    do {
+        self->id = ucs_generate_uuid((uintptr_t)self);
+    } while (self->id == 0 || self->id == UINT64_MAX);
+
+    // zero local control block and fifo
+    memset(self->local_ctrl, 0, UCT_CXL_CTRL_SIZE);
+    memset(self->rx.fifo, 0, UCT_CXL_FIFO_SIZE);
+
+    uct_cxl_fence();
+
+    uct_cxl_io_write64(&self->local_ctrl->iface_id, self->id);
+
+    uct_cxl_fence();
+
+    // For PoC, leave simple. Later could OR in a version number
+    // to ensure compatible versions
+    uct_cxl_io_write64(&self->local_ctrl->magic, UCT_CXL_MAGIC);
+
     return UCS_OK;
 }
 
 static UCS_CLASS_CLEANUP_FUNC(uct_cxl_iface_t)
 {
+    ucs_assert(ucs_queue_is_empty(&self->tx.pending));
+    // Zero magic so iface will no longer be seen as valid
+    uct_cxl_io_write64(&self->local_ctrl->magic, 0);
+    uct_cxl_fence();
+
+    ucs_spin_lock(&self->md->lock);
+    self->md->iface_in_use = 0;
+    ucs_spin_unlock(&self->md->lock);
 }
 
 UCS_CLASS_DEFINE(uct_cxl_iface_t, uct_base_iface_t);

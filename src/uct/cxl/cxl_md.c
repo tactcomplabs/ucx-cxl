@@ -238,7 +238,7 @@ ucs_status_t
 uct_cxl_mkey_pack(uct_md_h md, uct_mem_h memh, void *address, size_t length,
                   const uct_md_mkey_pack_params_t *params, void *mkey_buffer)
 {
-    //TODO: needs to be supported for our plan, but get everything linking first
+    /* TODO: needs to be supported for our plan, but get everything linking first */
     return UCS_ERR_UNSUPPORTED;
 }
 
@@ -379,7 +379,7 @@ uct_cxl_md_open(uct_component_t *component, const char *md_name,
     UCS_STATIC_ASSERT(sizeof(uct_cxl_fifo_elem_t) == UCT_CXL_FIFO_ELEM_SIZE);
     UCS_STATIC_ASSERT(ucs_offsetof(uct_cxl_fifo_elem_t, seq) == 0);
     UCS_STATIC_ASSERT((ucs_offsetof(uct_cxl_fifo_elem_t, payload) % 8) == 0);
-    UCS_STATIC_ASSERT((ucs_offsetof(uct_cxl_fifo_ctl_t, ack) % 8) == 0);
+    UCS_STATIC_ASSERT((ucs_offsetof(uct_cxl_fifo_ctrl_t, ack) % 8) == 0);
     UCS_STATIC_ASSERT((UCT_CXL_FIFO_OFFSET % UCT_CXL_ALIGN) == 0);
 
     if (config->aperture_size < UCT_CXL_RMA_OFFSET + UCT_CXL_ALIGN) {

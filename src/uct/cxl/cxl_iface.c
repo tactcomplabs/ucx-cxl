@@ -47,12 +47,12 @@ uct_cxl_iface_query(uct_iface_h tl_iface, uct_iface_attr_t *iface_attr)
     iface_attr->cap.put.max_bcopy = UCT_CXL_RMA_MAX_BCOPY;
     iface_attr->cap.get.max_bcopy = UCT_CXL_RMA_MAX_BCOPY;
     /* am_short carries its 8-byte header inside the payload */
-    iface_attr->cap.am.max_short  = ucs_field_sizeof(uct_cxl_fifo_elem_t,
-                                                     payload) -
+    iface_attr->cap.am.max_short = ucs_field_sizeof(uct_cxl_fifo_elem_t,
+                                                    payload) -
                                    sizeof(uint64_t);
-    iface_attr->cap.am.max_bcopy  = ucs_field_sizeof(uct_cxl_fifo_elem_t,
-                                                     payload);
-    iface_attr->cap.am.max_iov    = 1;
+    iface_attr->cap.am.max_bcopy = ucs_field_sizeof(uct_cxl_fifo_elem_t,
+                                                    payload);
+    iface_attr->cap.am.max_iov   = 1;
 
     iface_attr->latency             = UCT_CXL_IFACE_LATENCY;
     iface_attr->bandwidth.dedicated = UCT_CXL_IFACE_BANDWIDTH_DEDICATED;
@@ -66,15 +66,43 @@ static int
 uct_cxl_iface_is_reachable_v2(const uct_iface_h tl_iface,
                               const uct_iface_is_reachable_params_t *params)
 {
-    /* TODO: (Track A) check magic and iface_id */
+    uct_cxl_iface_t *iface = ucs_derived_of(tl_iface, uct_cxl_iface_t);
+    uint64_t remote_id;
+
+    if (!uct_iface_is_reachable_params_addrs_valid(params)) {
+        return 0;
+    }
+
+    if (params->iface_addr == NULL) {
+        uct_iface_fill_info_str_buf(params, "iface address is empty");
+        return 0;
+    }
+
+    memcpy(&remote_id, params->iface_addr, sizeof(remote_id));
+    if (remote_id == iface->id) {
+        uct_iface_fill_info_str_buf(params, "loopback is not supported");
+        return 0;
+    }
+
+    /* All cheap checks have passed, subsequent checks go over socket */
+    if (uct_cxl_io_read64(&iface->remote_ctrl->magic) != UCT_CXL_MAGIC) {
+        uct_iface_fill_info_str_buf(params, "peer iface is not initialized");
+        return 0;
+    }
+
+    if (uct_cxl_io_read64(&iface->remote_ctrl->iface_id) != remote_id) {
+        uct_iface_fill_info_str_buf(params, "address is not the linked peer");
+        return 0;
+    }
+
     return 1;
 }
 
 static ucs_status_t
 uct_cxl_iface_get_address(uct_iface_h tl_iface, uct_iface_addr_t *addr)
 {
-    uct_cxl_iface_t *iface        = ucs_derived_of(tl_iface, uct_cxl_iface_t);
-    *(uct_cxl_iface_addr_t *)addr = iface->id;
+    uct_cxl_iface_t *iface = ucs_derived_of(tl_iface, uct_cxl_iface_t);
+    memcpy(addr, &iface->id, sizeof(iface->id));
     return UCS_OK;
 }
 

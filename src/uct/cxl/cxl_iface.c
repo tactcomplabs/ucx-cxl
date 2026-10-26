@@ -125,8 +125,7 @@ static uct_iface_internal_ops_t uct_cxl_iface_internal_ops = {
 static uct_iface_ops_t uct_cxl_iface_ops = {
         .ep_put_short = (uct_ep_put_short_func_t)
                 ucs_empty_function_return_unsupported,
-        // TODO: put_bcopy, get_bcopy, am_short, am_bcopy are fully needed.
-        // Implement!
+        // TODO: am_short, am_bcopy are fully needed. Implement!
         .ep_put_bcopy    = uct_cxl_ep_put_bcopy,
         .ep_get_bcopy    = uct_cxl_ep_get_bcopy,
         .ep_am_short     = uct_cxl_ep_am_short,
@@ -190,6 +189,16 @@ static UCS_CLASS_INIT_FUNC(uct_cxl_iface_t, uct_md_h md, uct_worker_h worker,
         return UCS_ERR_BUSY;
     }
 
+    /* pack_cb/unpack_cb must not touch the aperture, so stage through here */
+    self->rma_bounce = ucs_malloc(UCT_CXL_RMA_MAX_BCOPY, "uct_cxl_rma_bounce");
+    if (self->rma_bounce == NULL) {
+        ucs_error("cxl: failed to allocate RMA bounce buffer");
+        ucs_spin_lock(&cxl_md->lock);
+        cxl_md->iface_in_use = 0;
+        ucs_spin_unlock(&cxl_md->lock);
+        return UCS_ERR_NO_MEMORY;
+    }
+
     self->md          = cxl_md;
     self->tx.fifo     = UCS_PTR_BYTE_OFFSET(cxl_md->aperture_base,
                                             UCT_CXL_FIFO_OFFSET);
@@ -233,6 +242,8 @@ static UCS_CLASS_CLEANUP_FUNC(uct_cxl_iface_t)
     // Zero magic so iface will no longer be seen as valid
     uct_cxl_io_write64(&self->local_ctrl->magic, 0);
     uct_cxl_fence();
+
+    ucs_free(self->rma_bounce);
 
     ucs_spin_lock(&self->md->lock);
     self->md->iface_in_use = 0;

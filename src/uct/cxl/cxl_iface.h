@@ -19,6 +19,7 @@ typedef struct uct_cxl_iface {
     uint64_t id; /* unique iface identifier */
     uct_cxl_ctrl_t *local_ctrl; /* own control in RAM */
     uct_cxl_ctrl_t *remote_ctrl; /* peer control over aperture */
+    void *rma_bounce; /* UCT_CXL_RMA_MAX_BCOPY bytes, put/get staging */
     struct {
         uct_cxl_fifo_elem_t *fifo; /* peer's RX, via aperture */
         uint64_t head; /* next sequence index to send */

@@ -3,7 +3,6 @@
 
 #include <uct/base/uct_iface.h>
 #include <uct/base/uct_md.h>
-#include <uct/base/uct_ep.h>
 #include "cxl_iface.h"
 
 typedef struct uct_cxl_ep {

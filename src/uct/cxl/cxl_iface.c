@@ -21,14 +21,6 @@ uct_cxl_iface_query_tl_devices(uct_md_h md,
                                       num_tl_devices_p);
 }
 
-// busy-poll fifo_ctl->tail's slot seq, dispatch via
-// uct_iface_invoke_am(), advance tail. This is the direct analog of
-// mm_iface.c's FIFO poll loop
-static unsigned uct_cxl_iface_progress(uct_iface_h iface)
-{
-    return 0;
-}
-
 static int uct_cxl_iface_poll_one(uct_cxl_iface_t *iface)
 {
     uint64_t tail             = iface->rx.tail;
@@ -63,6 +55,16 @@ static int uct_cxl_iface_poll_one(uct_cxl_iface_t *iface)
     return 1;
 }
 
+static void uct_cxl_iface_dispatch_pending(uct_cxl_iface_t *iface)
+{
+    uct_cxl_pending_req_priv_t *priv;
+
+    iface->tx.dispatching = 1;
+    uct_pending_queue_dispatch(priv, &iface->tx.pending,
+                               uct_cxl_iface_tx_slot_free(iface));
+    iface->tx.dispatching = 0;
+}
+
 static unsigned uct_cxl_iface_progress(uct_iface_h tl_iface)
 {
     uct_cxl_iface_t *iface = ucs_derived_of(tl_iface, uct_cxl_iface_t);
@@ -74,16 +76,6 @@ static unsigned uct_cxl_iface_progress(uct_iface_h tl_iface)
 
     uct_cxl_iface_dispatch_pending(iface);
     return count;
-}
-
-static void uct_cxl_iface_dispatch_pending(uct_cxl_iface_t *iface)
-{
-    uct_cxl_pending_req_priv_t *priv;
-
-    iface->tx.dispatching = 1;
-    uct_pending_queue_dispatch(priv, &iface->tx.pending,
-                               uct_cxl_iface_tx_slot_free(iface));
-    iface->tx.dispatching = 0;
 }
 
 static ucs_status_t

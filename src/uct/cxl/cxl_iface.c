@@ -238,6 +238,9 @@ static UCS_CLASS_INIT_FUNC(uct_cxl_iface_t, uct_md_h md, uct_worker_h worker,
 
 static UCS_CLASS_CLEANUP_FUNC(uct_cxl_iface_t)
 {
+    uct_base_iface_progress_disable(&self->super.super,
+                                    UCT_PROGRESS_SEND | UCT_PROGRESS_RECV);
+
     ucs_assert(ucs_queue_is_empty(&self->tx.pending));
     // Zero magic so iface will no longer be seen as valid
     uct_cxl_io_write64(&self->local_ctrl->magic, 0);

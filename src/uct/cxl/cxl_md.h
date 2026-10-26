@@ -39,6 +39,7 @@
 
 /* Placeholder, subject to change */
 #define UCT_CXL_RMA_MAX_BCOPY 8192
+#define UCT_CXL_RMA_MAX_SHORT 256
 
 typedef struct uct_cxl_packed_rkey {
     uint64_t seg_offset; /* From the start of the owner's memdev */

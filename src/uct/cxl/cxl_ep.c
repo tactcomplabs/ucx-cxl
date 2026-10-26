@@ -53,6 +53,29 @@ static ucs_status_t uct_cxl_ep_rma_ptr(uct_cxl_iface_t *iface,
     return UCS_OK;
 }
 
+/* UCP only selects RMA lanes that support put_short. buffer is ordinary host
+ * memory, so it is copied straight to the aperture with no bounce. */
+ucs_status_t uct_cxl_ep_put_short(uct_ep_h tl_ep, const void *buffer,
+                                  unsigned length, uint64_t remote_addr,
+                                  uct_rkey_t rkey)
+{
+    uct_cxl_iface_t *iface = ucs_derived_of(tl_ep->iface, uct_cxl_iface_t);
+    ucs_status_t status;
+    void *mmio;
+
+    UCT_CHECK_LENGTH(length, 0, UCT_CXL_RMA_MAX_SHORT, "put_short");
+
+    status = uct_cxl_ep_rma_ptr(iface, remote_addr, rkey, length, &mmio);
+    if (status != UCS_OK) {
+        return status;
+    }
+
+    uct_cxl_io_write(mmio, buffer, length);
+    ucs_trace_data("PUT_SHORT [size %u] to 0x%" PRIx64, length, remote_addr);
+    UCT_TL_EP_STAT_OP(ucs_derived_of(tl_ep, uct_base_ep_t), PUT, SHORT, length);
+    return UCS_OK;
+}
+
 // NOTE: overloaded return type; return >=0 signifies successful, number of bytes copied.
 // Negative return values are ucs_status_t values
 ssize_t uct_cxl_ep_put_bcopy(uct_ep_h tl_ep, uct_pack_callback_t pack_cb,

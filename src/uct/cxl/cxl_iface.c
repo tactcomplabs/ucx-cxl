@@ -35,7 +35,8 @@ uct_cxl_iface_query(uct_iface_h tl_iface, uct_iface_attr_t *iface_attr)
     uct_cxl_iface_t *iface = ucs_derived_of(tl_iface, uct_cxl_iface_t);
 
     uct_base_iface_query(&iface->super, iface_attr);
-    iface_attr->cap.flags = UCT_IFACE_FLAG_PUT_BCOPY |
+    iface_attr->cap.flags = UCT_IFACE_FLAG_PUT_SHORT |
+                            UCT_IFACE_FLAG_PUT_BCOPY |
                             UCT_IFACE_FLAG_GET_BCOPY | UCT_IFACE_FLAG_AM_SHORT |
                             UCT_IFACE_FLAG_AM_BCOPY | UCT_IFACE_FLAG_PENDING |
                             UCT_IFACE_FLAG_CB_SYNC |
@@ -44,6 +45,7 @@ uct_cxl_iface_query(uct_iface_h tl_iface, uct_iface_attr_t *iface_attr)
     iface_attr->device_addr_len   = 0;
     iface_attr->ep_addr_len       = 0;
     iface_attr->max_conn_priv     = 0;
+    iface_attr->cap.put.max_short = UCT_CXL_RMA_MAX_SHORT;
     iface_attr->cap.put.max_bcopy = UCT_CXL_RMA_MAX_BCOPY;
     iface_attr->cap.get.max_bcopy = UCT_CXL_RMA_MAX_BCOPY;
     /* am_short carries its 8-byte header inside the payload */
@@ -123,8 +125,7 @@ static uct_iface_internal_ops_t uct_cxl_iface_internal_ops = {
                 ucs_empty_function_return_unsupported};
 
 static uct_iface_ops_t uct_cxl_iface_ops = {
-        .ep_put_short = (uct_ep_put_short_func_t)
-                ucs_empty_function_return_unsupported,
+        .ep_put_short = uct_cxl_ep_put_short,
         // TODO: am_short, am_bcopy are fully needed. Implement!
         .ep_put_bcopy    = uct_cxl_ep_put_bcopy,
         .ep_get_bcopy    = uct_cxl_ep_get_bcopy,

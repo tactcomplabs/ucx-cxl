@@ -41,10 +41,18 @@
 #define UCT_CXL_RMA_MAX_BCOPY 8192
 
 typedef struct uct_cxl_packed_rkey {
+    uint64_t seg_offset; /* From the start of the owner's memdev */
+    uint64_t seg_addr; /* Owner's VA of seg_offset, used in arithmetic only */
+    uint64_t length;
+} UCS_S_PACKED uct_cxl_packed_rkey_t;
+
+/* Unpacked rkey, uct_rkey_t is a pointer to it. rkey_unpack gets no MD, so it
+ * can't hold the local aperture_base; put/get add that themselves. */
+typedef struct uct_cxl_rkey {
     uint64_t seg_offset;
     uint64_t seg_addr;
     uint64_t length;
-} UCS_S_PACKED uct_cxl_packed_rkey_t;
+} uct_cxl_rkey_t;
 
 
 /* A range of the local RMA region. Returned by mem_alloc as the memh. If

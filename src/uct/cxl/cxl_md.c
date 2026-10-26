@@ -181,12 +181,33 @@ static ucs_status_t uct_cxl_mem_free(uct_md_h tl_md, uct_mem_h memh)
     return UCS_OK;
 }
 
-ucs_status_t
-uct_cxl_mkey_pack(uct_md_h md, uct_mem_h memh, void *address, size_t length,
+/* Packs [address, address + length), which must lie within the memh */
+static ucs_status_t
+uct_cxl_mkey_pack(uct_md_h tl_md, uct_mem_h memh, void *address, size_t length,
                   const uct_md_mkey_pack_params_t *params, void *mkey_buffer)
 {
-    /* TODO: needs to be supported for our plan, but get everything linking first */
-    return UCS_ERR_UNSUPPORTED;
+    uct_cxl_md_t *md                   = ucs_derived_of(tl_md, uct_cxl_md_t);
+    uct_cxl_seg_t *seg                 = memh;
+    uct_cxl_packed_rkey_t *packed_rkey = mkey_buffer;
+    void *seg_base = UCS_PTR_BYTE_OFFSET(md->local_base, seg->offset);
+    size_t offset  = UCS_PTR_BYTE_DIFF(seg_base, address);
+
+    /* Is this segment inside the RMA range (i.e. from uct_cxl_alloc)? */
+    ucs_assertv((seg->offset >= UCT_CXL_RMA_OFFSET) &&
+                        (seg->offset + seg->length <= md->aperture_size),
+                "seg=[0x%" PRIx64 ", 0x%" PRIx64 ")", seg->offset,
+                seg->offset + seg->length);
+
+    /* [address, address + length] lies within [seg_base, seg_base + seg->length] */
+    ucs_assertv((address >= seg_base) && (offset <= seg->length) &&
+                        (length <= seg->length - offset),
+                "address=%p length=%zu seg=%p length=%zu", address, length,
+                seg_base, seg->length);
+
+    packed_rkey->seg_offset = seg->offset + offset;
+    packed_rkey->seg_addr   = (uintptr_t)address;
+    packed_rkey->length     = length;
+    return UCS_OK;
 }
 
 static ucs_status_t uct_cxl_rkey_unpack(uct_component_t *component,
@@ -194,8 +215,55 @@ static ucs_status_t uct_cxl_rkey_unpack(uct_component_t *component,
                                         const uct_rkey_unpack_params_t *params,
                                         uct_rkey_t *rkey_p, void **handle_p)
 {
-    // TODO: implement
-    return UCS_ERR_UNSUPPORTED;
+    /* rkey_buffer may be unaligned; the packed struct is read bytewise */
+    const uct_cxl_packed_rkey_t *packed_rkey = rkey_buffer;
+    uct_cxl_rkey_t *rkey;
+
+    /* The aperture bound is checked by put/get, which have the MD */
+    if ((packed_rkey->seg_offset < UCT_CXL_RMA_OFFSET) ||
+        (packed_rkey->length > UINT64_MAX - packed_rkey->seg_offset)) {
+        ucs_error("cxl: invalid rkey: offset 0x%" PRIx64 " length %" PRIu64,
+                  packed_rkey->seg_offset, packed_rkey->length);
+        return UCS_ERR_INVALID_PARAM;
+    }
+
+    rkey = ucs_malloc(sizeof(*rkey), "uct_cxl_rkey");
+    if (rkey == NULL) {
+        ucs_error("cxl: failed to allocate rkey");
+        return UCS_ERR_NO_MEMORY;
+    }
+
+    rkey->seg_offset = packed_rkey->seg_offset;
+    rkey->seg_addr   = packed_rkey->seg_addr;
+    rkey->length     = packed_rkey->length;
+
+    *rkey_p   = (uintptr_t)rkey;
+    *handle_p = NULL;
+    return UCS_OK;
+}
+
+static ucs_status_t
+uct_cxl_rkey_release(uct_component_t *component, uct_rkey_t rkey, void *handle)
+{
+    ucs_free((void *)rkey);
+    return UCS_OK;
+}
+
+/* Each unpack allocates, so compare what the rkeys describe, not pointers */
+static ucs_status_t
+uct_cxl_rkey_compare(uct_component_t *component, uct_rkey_t rkey1,
+                     uct_rkey_t rkey2, const uct_rkey_compare_params_t *params,
+                     int *result)
+{
+    const uct_cxl_rkey_t *r1 = (const uct_cxl_rkey_t *)rkey1;
+    const uct_cxl_rkey_t *r2 = (const uct_cxl_rkey_t *)rkey2;
+
+    if ((params->field_mask != 0) || (result == NULL)) {
+        return UCS_ERR_INVALID_PARAM;
+    }
+
+    *result = memcmp(r1, r2, sizeof(*r1));
+    return UCS_OK;
 }
 
 static ucs_status_t uct_cxl_md_query(uct_md_h tl_md, uct_md_attr_v2_t *attr)
@@ -314,8 +382,7 @@ uct_md_ops_t uct_cxl_md_ops = {
                 ucs_empty_function_return_unsupported,
         .mem_query = (uct_md_mem_query_func_t)
                 ucs_empty_function_return_unsupported,
-        .mkey_pack =
-                uct_cxl_mkey_pack, /* needs a real minimal body, see below */
+        .mkey_pack  = uct_cxl_mkey_pack,
         .mem_attach = (uct_md_mem_attach_func_t)
                 ucs_empty_function_return_unsupported,
         .detect_memory_type = (uct_md_detect_memory_type_func_t)
@@ -414,9 +481,8 @@ uct_component_t uct_cxl_component = {
         .rkey_unpack = uct_cxl_rkey_unpack,
         .rkey_ptr    = (uct_component_rkey_ptr_func_t)
                 ucs_empty_function_return_unsupported,
-        .rkey_release = (uct_component_rkey_release_func_t)
-                ucs_empty_function_return_success,
-        .rkey_compare = uct_base_rkey_compare,
+        .rkey_release = uct_cxl_rkey_release,
+        .rkey_compare = uct_cxl_rkey_compare,
         .name         = "cxl",
         .md_config =
                 {

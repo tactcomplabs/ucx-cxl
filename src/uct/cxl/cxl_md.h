@@ -27,6 +27,7 @@
 #define UCT_CXL_FIFO_DEPTH     64
 #define UCT_CXL_FIFO_OFFSET    (UCT_CXL_CTRL_OFFSET + UCT_CXL_CTRL_SIZE)
 #define UCT_CXL_FIFO_SIZE      (UCT_CXL_FIFO_ELEM_SIZE * UCT_CXL_FIFO_DEPTH)
+#define UCT_CXL_FIFO_PAYLOAD_SIZE (UCT_CXL_FIFO_ELEM_SIZE - 16)
 
 /* [UCT_CXL_RMA_OFFSET, aperture_size) of the *local* memdev is handed out by
  * mem_alloc. Each guest owns its own memdev's RMA region, so the two peers'
@@ -68,7 +69,7 @@ typedef struct uct_cxl_fifo_elem {
     uint32_t length;
     uint8_t am_id;
     uint8_t reserved[3]; /* padding (unused) */
-    uint8_t payload[UCT_CXL_FIFO_ELEM_SIZE - 16];
+    uint8_t payload[UCT_CXL_FIFO_PAYLOAD_SIZE];
 } UCS_S_PACKED uct_cxl_fifo_elem_t;
 
 typedef struct uct_cxl_md {

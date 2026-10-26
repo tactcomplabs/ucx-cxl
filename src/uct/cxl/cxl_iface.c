@@ -29,6 +29,63 @@ static unsigned uct_cxl_iface_progress(uct_iface_h iface)
     return 0;
 }
 
+static int uct_cxl_iface_poll_one(uct_cxl_iface_t *iface)
+{
+    uint64_t tail             = iface->rx.tail;
+    unsigned idx              = tail % UCT_CXL_FIFO_DEPTH;
+    uct_cxl_fifo_elem_t *elem = &iface->rx.fifo[idx];
+    uint8_t buf[UCT_CXL_FIFO_PAYLOAD_SIZE];
+    uint64_t meta;
+    uint32_t length;
+    uint8_t am_id;
+
+    if (uct_cxl_io_read64(elem) != tail + 1) {
+        return 0;
+    }
+
+    uct_cxl_fence(); /* F3: seq before contents */
+    meta   = uct_cxl_io_read64(UCS_PTR_BYTE_OFFSET(
+                   elem, ucs_offsetof(uct_cxl_fifo_elem_t, length)));
+    length = (uint32_t)meta;
+    am_id  = (uint8_t)(meta >> 32);
+    if ((length > UCT_CXL_FIFO_PAYLOAD_SIZE) || (am_id >= UCT_AM_ID_MAX)) {
+        ucs_fatal("cxl: corrupt FIFO element %" PRIu64 ": length %u am_id %u",
+                  tail, length, am_id);
+    }
+    uct_cxl_io_read(buf, elem->payload, length);
+
+    uct_cxl_fence(); /* F4: contents copied out before releasing the slot */
+    uct_cxl_io_write64(&iface->aperture_ctrl->ack[idx], tail + 1);
+    iface->rx.tail = tail + 1;
+
+    /* State is consistent, so the handler may send */
+    uct_iface_invoke_am(&iface->super, am_id, buf, length, 0);
+    return 1;
+}
+
+static unsigned uct_cxl_iface_progress(uct_iface_h tl_iface)
+{
+    uct_cxl_iface_t *iface = ucs_derived_of(tl_iface, uct_cxl_iface_t);
+    unsigned count         = 0;
+
+    while ((count < UCT_CXL_FIFO_DEPTH) && uct_cxl_iface_poll_one(iface)) {
+        ++count;
+    }
+
+    uct_cxl_iface_dispatch_pending(iface);
+    return count;
+}
+
+static void uct_cxl_iface_dispatch_pending(uct_cxl_iface_t *iface)
+{
+    uct_cxl_pending_req_priv_t *priv;
+
+    iface->tx.dispatching = 1;
+    uct_pending_queue_dispatch(priv, &iface->tx.pending,
+                               uct_cxl_iface_tx_slot_free(iface));
+    iface->tx.dispatching = 0;
+}
+
 static ucs_status_t
 uct_cxl_iface_query(uct_iface_h tl_iface, uct_iface_attr_t *iface_attr)
 {
@@ -46,8 +103,8 @@ uct_cxl_iface_query(uct_iface_h tl_iface, uct_iface_attr_t *iface_attr)
     iface_attr->max_conn_priv     = 0;
     iface_attr->cap.put.max_bcopy = UCT_CXL_RMA_MAX_BCOPY;
     iface_attr->cap.get.max_bcopy = UCT_CXL_RMA_MAX_BCOPY;
-    iface_attr->cap.am.max_short  = UCT_CXL_FIFO_ELEM_SIZE - 16 - 8;
-    iface_attr->cap.am.max_bcopy  = UCT_CXL_FIFO_ELEM_SIZE - 16;
+    iface_attr->cap.am.max_short  = UCT_CXL_FIFO_ELEM_SIZE - UCT_CXL_FIFO_HDR_SIZE - 8;
+    iface_attr->cap.am.max_bcopy  = UCT_CXL_FIFO_ELEM_SIZE - UCT_CXL_FIFO_HDR_SIZE;
     iface_attr->cap.am.max_iov    = 1;
 
     iface_attr->latency             = UCT_CXL_IFACE_LATENCY;
@@ -116,9 +173,8 @@ static uct_iface_ops_t uct_cxl_iface_ops = {
         .ep_flush = uct_base_ep_flush,
         .ep_fence = uct_base_ep_fence,
         .ep_check = (uct_ep_check_func_t)ucs_empty_function_return_success,
-        .ep_pending_add = (uct_ep_pending_add_func_t)
-                ucs_empty_function_return_busy,
-        .ep_pending_purge = (uct_ep_pending_purge_func_t)ucs_empty_function,
+        .ep_pending_add = uct_cxl_ep_pending_add,
+        .ep_pending_purge = uct_cxl_ep_pending_purge,
         .ep_create        = UCS_CLASS_NEW_FUNC_NAME(uct_cxl_ep_t),
         .ep_destroy       = UCS_CLASS_DELETE_FUNC_NAME(uct_cxl_ep_t),
         .iface_flush      = uct_base_iface_flush,
@@ -158,6 +214,9 @@ static UCS_CLASS_INIT_FUNC(uct_cxl_iface_t, uct_md_h md, uct_worker_h worker,
         return UCS_ERR_BUSY;
     }
 
+    ucs_assert(ucs_offsetof(uct_cxl_fifo_elem_t, length) == 8);
+    ucs_assert(ucs_offsetof(uct_cxl_fifo_elem_t, am_id) == 12);
+
     self->md            = cxl_md;
     self->tx.fifo       = UCS_PTR_BYTE_OFFSET(cxl_md->aperture_base,
                                               UCT_CXL_FIFO_OFFSET);
@@ -169,6 +228,7 @@ static UCS_CLASS_INIT_FUNC(uct_cxl_iface_t, uct_md_h md, uct_worker_h worker,
                                               UCT_CXL_CTRL_OFFSET);
     self->tx.head       = 0;
     ucs_queue_head_init(&self->tx.pending);
+    self->tx.dispatching = 0;
     self->rx.tail = 0;
 
     // Generate unique id for the iface, so it can be correctly

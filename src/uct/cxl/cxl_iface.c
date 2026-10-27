@@ -48,7 +48,7 @@ static int uct_cxl_iface_poll_one(uct_cxl_iface_t *iface)
     uct_cxl_io_read(buf, elem->payload, length);
 
     uct_cxl_fence(); /* F4: contents copied out before releasing the slot */
-    uct_cxl_io_write64(&iface->aperture_ctrl->ack[idx], tail + 1);
+    uct_cxl_io_write64(&iface->remote_ctrl->ack[idx], tail + 1);
     iface->rx.tail = tail + 1;
 
     /* State is consistent, so the handler may send */

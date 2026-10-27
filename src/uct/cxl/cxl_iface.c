@@ -238,14 +238,16 @@ static UCS_CLASS_INIT_FUNC(uct_cxl_iface_t, uct_md_h md, uct_worker_h worker,
     UCS_STATIC_ASSERT(ucs_offsetof(uct_cxl_fifo_elem_t, length) == 8);
     UCS_STATIC_ASSERT(ucs_offsetof(uct_cxl_fifo_elem_t, am_id) == 12);
 
-    self->md         = cxl_md;
-    self->tx.fifo    = UCS_PTR_BYTE_OFFSET(cxl_md->aperture_base,
-                                           UCT_CXL_FIFO_OFFSET);
-    self->rx.fifo    = UCS_PTR_BYTE_OFFSET(cxl_md->local_base,
-                                           UCT_CXL_FIFO_OFFSET);
-    self->local_ctrl = UCS_PTR_BYTE_OFFSET(cxl_md->local_base,
-                                           UCT_CXL_CTRL_OFFSET);
-    self->tx.head    = 0;
+    self->md          = cxl_md;
+    self->tx.fifo     = UCS_PTR_BYTE_OFFSET(cxl_md->aperture_base,
+                                            UCT_CXL_FIFO_OFFSET);
+    self->rx.fifo     = UCS_PTR_BYTE_OFFSET(cxl_md->local_base,
+                                            UCT_CXL_FIFO_OFFSET);
+    self->local_ctrl  = UCS_PTR_BYTE_OFFSET(cxl_md->local_base,
+                                            UCT_CXL_CTRL_OFFSET);
+    self->remote_ctrl = UCS_PTR_BYTE_OFFSET(cxl_md->aperture_base,
+                                            UCT_CXL_CTRL_OFFSET);
+    self->tx.head     = 0;
     /* pack_cb/unpack_cb must not touch the aperture, so stage through here */
     self->rma_bounce = ucs_malloc(UCT_CXL_RMA_MAX_BCOPY, "uct_cxl_rma_bounce");
     if (self->rma_bounce == NULL) {
@@ -286,9 +288,6 @@ static UCS_CLASS_INIT_FUNC(uct_cxl_iface_t, uct_md_h md, uct_worker_h worker,
 
 static UCS_CLASS_CLEANUP_FUNC(uct_cxl_iface_t)
 {
-    uct_base_iface_progress_disable(&self->super.super,
-                                    UCT_PROGRESS_SEND | UCT_PROGRESS_RECV);
-
     ucs_assert(ucs_queue_is_empty(&self->tx.pending));
     uct_base_iface_progress_disable(&self->super.super,
                                     UCT_PROGRESS_SEND | UCT_PROGRESS_RECV);

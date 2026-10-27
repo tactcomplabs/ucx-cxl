@@ -85,7 +85,8 @@ uct_cxl_iface_query(uct_iface_h tl_iface, uct_iface_attr_t *iface_attr)
     uct_cxl_iface_t *iface = ucs_derived_of(tl_iface, uct_cxl_iface_t);
 
     uct_base_iface_query(&iface->super, iface_attr);
-    iface_attr->cap.flags = UCT_IFACE_FLAG_PUT_BCOPY |
+    iface_attr->cap.flags = UCT_IFACE_FLAG_PUT_SHORT |
+                            UCT_IFACE_FLAG_PUT_BCOPY |
                             UCT_IFACE_FLAG_GET_BCOPY | UCT_IFACE_FLAG_AM_SHORT |
                             UCT_IFACE_FLAG_AM_BCOPY | UCT_IFACE_FLAG_PENDING |
                             UCT_IFACE_FLAG_CB_SYNC |
@@ -94,13 +95,13 @@ uct_cxl_iface_query(uct_iface_h tl_iface, uct_iface_attr_t *iface_attr)
     iface_attr->device_addr_len   = 0;
     iface_attr->ep_addr_len       = 0;
     iface_attr->max_conn_priv     = 0;
+    iface_attr->cap.put.max_short = UCT_CXL_RMA_MAX_SHORT;
     iface_attr->cap.put.max_bcopy = UCT_CXL_RMA_MAX_BCOPY;
     iface_attr->cap.get.max_bcopy = UCT_CXL_RMA_MAX_BCOPY;
-    iface_attr->cap.am.max_short  = UCT_CXL_FIFO_ELEM_SIZE -
-                                   UCT_CXL_FIFO_HDR_SIZE - 8;
-    iface_attr->cap.am.max_bcopy = UCT_CXL_FIFO_ELEM_SIZE -
-                                   UCT_CXL_FIFO_HDR_SIZE;
-    iface_attr->cap.am.max_iov = 1;
+    /* am_short carries an uint64_t header within its payload */
+    iface_attr->cap.am.max_short = UCT_CXL_FIFO_PAYLOAD_SIZE - sizeof(uint64_t);
+    iface_attr->cap.am.max_bcopy = UCT_CXL_FIFO_PAYLOAD_SIZE;
+    iface_attr->cap.am.max_iov   = 1;
 
     iface_attr->latency             = UCT_CXL_IFACE_LATENCY;
     iface_attr->bandwidth.dedicated = UCT_CXL_IFACE_BANDWIDTH_DEDICATED;
@@ -114,15 +115,43 @@ static int
 uct_cxl_iface_is_reachable_v2(const uct_iface_h tl_iface,
                               const uct_iface_is_reachable_params_t *params)
 {
-    /* TODO: (Track A) check magic and iface_id */
+    uct_cxl_iface_t *iface = ucs_derived_of(tl_iface, uct_cxl_iface_t);
+    uint64_t remote_id;
+
+    if (!uct_iface_is_reachable_params_addrs_valid(params)) {
+        return 0;
+    }
+
+    if (params->iface_addr == NULL) {
+        uct_iface_fill_info_str_buf(params, "iface address is empty");
+        return 0;
+    }
+
+    memcpy(&remote_id, params->iface_addr, sizeof(remote_id));
+    if (remote_id == iface->id) {
+        uct_iface_fill_info_str_buf(params, "loopback is not supported");
+        return 0;
+    }
+
+    /* All cheap checks have passed, subsequent checks go over socket */
+    if (uct_cxl_io_read64(&iface->remote_ctrl->magic) != UCT_CXL_MAGIC) {
+        uct_iface_fill_info_str_buf(params, "peer iface is not initialized");
+        return 0;
+    }
+
+    if (uct_cxl_io_read64(&iface->remote_ctrl->iface_id) != remote_id) {
+        uct_iface_fill_info_str_buf(params, "address is not the linked peer");
+        return 0;
+    }
+
     return 1;
 }
 
 static ucs_status_t
 uct_cxl_iface_get_address(uct_iface_h tl_iface, uct_iface_addr_t *addr)
 {
-    uct_cxl_iface_t *iface        = ucs_derived_of(tl_iface, uct_cxl_iface_t);
-    *(uct_cxl_iface_addr_t *)addr = iface->id;
+    uct_cxl_iface_t *iface = ucs_derived_of(tl_iface, uct_cxl_iface_t);
+    memcpy(addr, &iface->id, sizeof(iface->id));
     return UCS_OK;
 }
 
@@ -143,10 +172,7 @@ static uct_iface_internal_ops_t uct_cxl_iface_internal_ops = {
                 ucs_empty_function_return_unsupported};
 
 static uct_iface_ops_t uct_cxl_iface_ops = {
-        .ep_put_short = (uct_ep_put_short_func_t)
-                ucs_empty_function_return_unsupported,
-        // TODO: put_bcopy, get_bcopy, am_short, am_bcopy are fully needed.
-        // Implement!
+        .ep_put_short    = uct_cxl_ep_put_short,
         .ep_put_bcopy    = uct_cxl_ep_put_bcopy,
         .ep_get_bcopy    = uct_cxl_ep_get_bcopy,
         .ep_am_short     = uct_cxl_ep_am_short,
@@ -212,16 +238,24 @@ static UCS_CLASS_INIT_FUNC(uct_cxl_iface_t, uct_md_h md, uct_worker_h worker,
     UCS_STATIC_ASSERT(ucs_offsetof(uct_cxl_fifo_elem_t, length) == 8);
     UCS_STATIC_ASSERT(ucs_offsetof(uct_cxl_fifo_elem_t, am_id) == 12);
 
-    self->md            = cxl_md;
-    self->tx.fifo       = UCS_PTR_BYTE_OFFSET(cxl_md->aperture_base,
-                                              UCT_CXL_FIFO_OFFSET);
-    self->rx.fifo       = UCS_PTR_BYTE_OFFSET(cxl_md->local_base,
-                                              UCT_CXL_FIFO_OFFSET);
-    self->local_ctrl    = UCS_PTR_BYTE_OFFSET(cxl_md->local_base,
-                                              UCT_CXL_CTRL_OFFSET);
-    self->aperture_ctrl = UCS_PTR_BYTE_OFFSET(cxl_md->aperture_base,
-                                              UCT_CXL_CTRL_OFFSET);
-    self->tx.head       = 0;
+    self->md         = cxl_md;
+    self->tx.fifo    = UCS_PTR_BYTE_OFFSET(cxl_md->aperture_base,
+                                           UCT_CXL_FIFO_OFFSET);
+    self->rx.fifo    = UCS_PTR_BYTE_OFFSET(cxl_md->local_base,
+                                           UCT_CXL_FIFO_OFFSET);
+    self->local_ctrl = UCS_PTR_BYTE_OFFSET(cxl_md->local_base,
+                                           UCT_CXL_CTRL_OFFSET);
+    self->tx.head    = 0;
+    /* pack_cb/unpack_cb must not touch the aperture, so stage through here */
+    self->rma_bounce = ucs_malloc(UCT_CXL_RMA_MAX_BCOPY, "uct_cxl_rma_bounce");
+    if (self->rma_bounce == NULL) {
+        ucs_error("cxl: failed to allocate RMA bounce buffer");
+        ucs_spin_lock(&cxl_md->lock);
+        cxl_md->iface_in_use = 0;
+        ucs_spin_unlock(&cxl_md->lock);
+        return UCS_ERR_NO_MEMORY;
+    }
+
     ucs_queue_head_init(&self->tx.pending);
     self->tx.dispatching = 0;
     self->rx.tail        = 0;
@@ -252,12 +286,17 @@ static UCS_CLASS_INIT_FUNC(uct_cxl_iface_t, uct_md_h md, uct_worker_h worker,
 
 static UCS_CLASS_CLEANUP_FUNC(uct_cxl_iface_t)
 {
+    uct_base_iface_progress_disable(&self->super.super,
+                                    UCT_PROGRESS_SEND | UCT_PROGRESS_RECV);
+
     ucs_assert(ucs_queue_is_empty(&self->tx.pending));
     uct_base_iface_progress_disable(&self->super.super,
                                     UCT_PROGRESS_SEND | UCT_PROGRESS_RECV);
     /* Zero magic so iface will no longer be seen as valid */
     uct_cxl_io_write64(&self->local_ctrl->magic, 0);
     uct_cxl_fence();
+
+    ucs_free(self->rma_bounce);
 
     ucs_spin_lock(&self->md->lock);
     self->md->iface_in_use = 0;

@@ -20,7 +20,7 @@
  * not negotiated at runtime */
 #define UCT_CXL_CTRL_OFFSET 0
 #define UCT_CXL_CTRL_SIZE                                                      \
-    ucs_align_up(sizeof(uct_cxl_fifo_ctrl_t), UCT_CXL_ALIGN)
+    ucs_align_up(sizeof(uct_cxl_ctrl_t), UCT_CXL_ALIGN)
 
 /* FIFO parameters */
 #define UCT_CXL_FIFO_ELEM_SIZE 256
@@ -39,12 +39,21 @@
 
 /* Placeholder, subject to change */
 #define UCT_CXL_RMA_MAX_BCOPY 8192
+#define UCT_CXL_RMA_MAX_SHORT 256
 
 typedef struct uct_cxl_packed_rkey {
+    uint64_t seg_offset; /* From the start of the owner's memdev */
+    uint64_t seg_addr; /* Owner's VA of seg_offset, used in arithmetic only */
+    uint64_t length;
+} UCS_S_PACKED uct_cxl_packed_rkey_t;
+
+/* Unpacked rkey, uct_rkey_t is a pointer to it. rkey_unpack gets no MD, so it
+ * can't hold the local aperture_base; put/get add that themselves. */
+typedef struct uct_cxl_rkey {
     uint64_t seg_offset;
     uint64_t seg_addr;
     uint64_t length;
-} UCS_S_PACKED uct_cxl_packed_rkey_t;
+} uct_cxl_rkey_t;
 
 
 /* A range of the local RMA region. Returned by mem_alloc as the memh. If
@@ -56,12 +65,12 @@ typedef struct uct_cxl_seg {
 } uct_cxl_seg_t;
 
 
-typedef struct uct_cxl_fifo_ctrl {
+typedef struct uct_cxl_ctrl {
     uint64_t magic; /* owner, at init */
     uint64_t iface_id; /* owner, at init; peer reads in is_reachable */
     uint64_t ack[UCT_CXL_FIFO_DEPTH]; /* PEER writes ack[i] = seq it consumed
                                           from slot i of OWNER's tx stream */
-} uct_cxl_fifo_ctrl_t;
+} uct_cxl_ctrl_t;
 
 typedef struct uct_cxl_fifo_elem {
     uint64_t seq; /* written last; valid iff == consumer index + 1 */

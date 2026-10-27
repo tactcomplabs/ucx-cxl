@@ -12,8 +12,9 @@
 #define UCT_CXL_IFACE_BANDWIDTH_SHARED    0
 #define UCT_CXL_IFACE_OVERHEAD            1e-6
 
-#define UCT_CXL_FIFO_HDR_SIZE     ucs_offsetof(uct_cxl_fifo_elem_t, payload)
-#define UCT_CXL_FIFO_PAYLOAD_SIZE (UCT_CXL_FIFO_ELEM_SIZE - UCT_CXL_FIFO_HDR_SIZE)
+#define UCT_CXL_FIFO_HDR_SIZE ucs_offsetof(uct_cxl_fifo_elem_t, payload)
+#define UCT_CXL_FIFO_PAYLOAD_SIZE                                              \
+    (UCT_CXL_FIFO_ELEM_SIZE - UCT_CXL_FIFO_HDR_SIZE)
 
 typedef uint64_t uct_cxl_iface_addr_t;
 
@@ -46,12 +47,14 @@ uct_cxl_iface_query_tl_devices(uct_md_h md,
 
 /* Slot head%DEPTH is free on the first lap, or once the peer acked the
  * sequence number that last occupied it */
-static UCS_F_ALWAYS_INLINE int uct_cxl_iface_tx_slot_free(uct_cxl_iface_t *iface)
+static UCS_F_ALWAYS_INLINE int
+uct_cxl_iface_tx_slot_free(uct_cxl_iface_t *iface)
 {
     uint64_t head = iface->tx.head;
 
     return (head < UCT_CXL_FIFO_DEPTH) ||
-           (uct_cxl_io_read64(&iface->local_ctrl->ack[head % UCT_CXL_FIFO_DEPTH]) ==
+           (uct_cxl_io_read64(
+                    &iface->local_ctrl->ack[head % UCT_CXL_FIFO_DEPTH]) ==
             head + 1 - UCT_CXL_FIFO_DEPTH);
 }
 

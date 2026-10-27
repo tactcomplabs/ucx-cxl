@@ -36,8 +36,9 @@ static int uct_cxl_iface_poll_one(uct_cxl_iface_t *iface)
     }
 
     uct_cxl_fence(); /* F3: seq before contents */
-    meta   = uct_cxl_io_read64(UCS_PTR_BYTE_OFFSET(
-                   elem, ucs_offsetof(uct_cxl_fifo_elem_t, length)));
+    meta = uct_cxl_io_read64(
+            UCS_PTR_BYTE_OFFSET(elem,
+                                ucs_offsetof(uct_cxl_fifo_elem_t, length)));
     length = (uint32_t)meta;
     am_id  = (uint8_t)(meta >> 32);
     if ((length > UCT_CXL_FIFO_PAYLOAD_SIZE) || (am_id >= UCT_AM_ID_MAX)) {
@@ -95,9 +96,11 @@ uct_cxl_iface_query(uct_iface_h tl_iface, uct_iface_attr_t *iface_attr)
     iface_attr->max_conn_priv     = 0;
     iface_attr->cap.put.max_bcopy = UCT_CXL_RMA_MAX_BCOPY;
     iface_attr->cap.get.max_bcopy = UCT_CXL_RMA_MAX_BCOPY;
-    iface_attr->cap.am.max_short  = UCT_CXL_FIFO_ELEM_SIZE - UCT_CXL_FIFO_HDR_SIZE - 8;
-    iface_attr->cap.am.max_bcopy  = UCT_CXL_FIFO_ELEM_SIZE - UCT_CXL_FIFO_HDR_SIZE;
-    iface_attr->cap.am.max_iov    = 1;
+    iface_attr->cap.am.max_short  = UCT_CXL_FIFO_ELEM_SIZE -
+                                   UCT_CXL_FIFO_HDR_SIZE - 8;
+    iface_attr->cap.am.max_bcopy = UCT_CXL_FIFO_ELEM_SIZE -
+                                   UCT_CXL_FIFO_HDR_SIZE;
+    iface_attr->cap.am.max_iov = 1;
 
     iface_attr->latency             = UCT_CXL_IFACE_LATENCY;
     iface_attr->bandwidth.dedicated = UCT_CXL_IFACE_BANDWIDTH_DEDICATED;
@@ -165,12 +168,12 @@ static uct_iface_ops_t uct_cxl_iface_ops = {
         .ep_flush = uct_base_ep_flush,
         .ep_fence = uct_base_ep_fence,
         .ep_check = (uct_ep_check_func_t)ucs_empty_function_return_success,
-        .ep_pending_add = uct_cxl_ep_pending_add,
-        .ep_pending_purge = uct_cxl_ep_pending_purge,
-        .ep_create        = UCS_CLASS_NEW_FUNC_NAME(uct_cxl_ep_t),
-        .ep_destroy       = UCS_CLASS_DELETE_FUNC_NAME(uct_cxl_ep_t),
-        .iface_flush      = uct_base_iface_flush,
-        .iface_fence      = uct_base_iface_fence,
+        .ep_pending_add           = uct_cxl_ep_pending_add,
+        .ep_pending_purge         = uct_cxl_ep_pending_purge,
+        .ep_create                = UCS_CLASS_NEW_FUNC_NAME(uct_cxl_ep_t),
+        .ep_destroy               = UCS_CLASS_DELETE_FUNC_NAME(uct_cxl_ep_t),
+        .iface_flush              = uct_base_iface_flush,
+        .iface_fence              = uct_base_iface_fence,
         .iface_progress_enable    = uct_base_iface_progress_enable,
         .iface_progress_disable   = uct_base_iface_progress_disable,
         .iface_progress           = uct_cxl_iface_progress,
@@ -206,8 +209,8 @@ static UCS_CLASS_INIT_FUNC(uct_cxl_iface_t, uct_md_h md, uct_worker_h worker,
         return UCS_ERR_BUSY;
     }
 
-    ucs_assert(ucs_offsetof(uct_cxl_fifo_elem_t, length) == 8);
-    ucs_assert(ucs_offsetof(uct_cxl_fifo_elem_t, am_id) == 12);
+    UCS_STATIC_ASSERT(ucs_offsetof(uct_cxl_fifo_elem_t, length) == 8);
+    UCS_STATIC_ASSERT(ucs_offsetof(uct_cxl_fifo_elem_t, am_id) == 12);
 
     self->md            = cxl_md;
     self->tx.fifo       = UCS_PTR_BYTE_OFFSET(cxl_md->aperture_base,
@@ -221,16 +224,16 @@ static UCS_CLASS_INIT_FUNC(uct_cxl_iface_t, uct_md_h md, uct_worker_h worker,
     self->tx.head       = 0;
     ucs_queue_head_init(&self->tx.pending);
     self->tx.dispatching = 0;
-    self->rx.tail = 0;
+    self->rx.tail        = 0;
 
-    // Generate unique id for the iface, so it can be correctly
-    // identified and loopback is avoided. Avoid troublesome edge
-    // cases
+    /* Generate unique id for the iface, so it can be correctly
+     * identified and loopback is avoided. Avoid troublesome edge
+     * cases */
     do {
         self->id = ucs_generate_uuid((uintptr_t)self);
     } while (self->id == 0 || self->id == UINT64_MAX);
 
-    // zero local control block and fifo
+    /* zero local control block and fifo */
     memset(self->local_ctrl, 0, UCT_CXL_CTRL_SIZE);
     memset(self->rx.fifo, 0, UCT_CXL_FIFO_SIZE);
 
@@ -240,8 +243,8 @@ static UCS_CLASS_INIT_FUNC(uct_cxl_iface_t, uct_md_h md, uct_worker_h worker,
 
     uct_cxl_fence();
 
-    // For PoC, leave simple. Later could OR in a version number
-    // to ensure compatible versions
+    /* For PoC, leave simple. Later could OR in a version number
+     * to ensure compatible versions */
     uct_cxl_io_write64(&self->local_ctrl->magic, UCT_CXL_MAGIC);
 
     return UCS_OK;
@@ -250,7 +253,9 @@ static UCS_CLASS_INIT_FUNC(uct_cxl_iface_t, uct_md_h md, uct_worker_h worker,
 static UCS_CLASS_CLEANUP_FUNC(uct_cxl_iface_t)
 {
     ucs_assert(ucs_queue_is_empty(&self->tx.pending));
-    // Zero magic so iface will no longer be seen as valid
+    uct_base_iface_progress_disable(&self->super.super,
+                                    UCT_PROGRESS_SEND | UCT_PROGRESS_RECV);
+    /* Zero magic so iface will no longer be seen as valid */
     uct_cxl_io_write64(&self->local_ctrl->magic, 0);
     uct_cxl_fence();
 

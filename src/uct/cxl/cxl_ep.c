@@ -14,8 +14,15 @@ static UCS_CLASS_INIT_FUNC(uct_cxl_ep_t, const uct_ep_params_t *params)
 
 static UCS_CLASS_CLEANUP_FUNC(uct_cxl_ep_t)
 {
-    /* TODO: add assert to check that no queued request still 
-   * points to this endpoint (since it's being cleaned up) */
+    uct_cxl_iface_t *iface = ucs_derived_of(self->super.super.iface,
+                                            uct_cxl_iface_t);
+    uct_cxl_pending_req_priv_t *priv;
+
+    /* The user must purge the EP's pending requests before destroying it */
+    ucs_queue_for_each(priv, &iface->tx.pending, base.queue_elem) {
+        ucs_assertv(priv->ep != self, "ep %p destroyed with a pending request",
+                    self);
+    }
 }
 
 UCS_CLASS_DEFINE(uct_cxl_ep_t, uct_base_ep_t);

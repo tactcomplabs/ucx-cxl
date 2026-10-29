@@ -221,7 +221,8 @@ gtest_SOURCES = \
 
 if HAVE_CXL
 gtest_SOURCES += \
-	uct/cxl/test_cxl_io.cc
+	uct/cxl/test_cxl_io.cc \
+	uct/cxl/test_cxl_fifo.cc
 endif
 
 if HAVE_IB

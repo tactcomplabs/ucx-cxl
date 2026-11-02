@@ -46,6 +46,10 @@ uct_cxl_iface_query_tl_devices(uct_md_h md,
                                uct_tl_device_resource_t **tl_devices_p,
                                unsigned *num_tl_devices_p);
 
+ucs_status_t uct_cxl_iface_fence(uct_iface_h tl_iface, unsigned flags);
+ucs_status_t uct_cxl_iface_flush(uct_iface_h tl_iface, unsigned flags,
+                                 uct_completion_t *comp);
+
 /* Slot head%DEPTH is free on the first lap, or once the peer acked the
  * sequence number that last occupied it */
 static UCS_F_ALWAYS_INLINE int

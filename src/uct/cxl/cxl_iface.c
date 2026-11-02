@@ -21,6 +21,23 @@ uct_cxl_iface_query_tl_devices(uct_md_h md,
                                       num_tl_devices_p);
 }
 
+ucs_status_t uct_cxl_iface_fence(uct_iface_h tl_iface, unsigned flags)
+{
+    uct_cxl_fence();
+    UCT_TL_IFACE_STAT_FENCE(ucs_derived_of(tl_iface, uct_base_iface_t));
+    return UCS_OK;
+}
+
+/* Puts complete synchronously, so ordering them is enough for remote
+ * completion; comp is never used */
+ucs_status_t uct_cxl_iface_flush(uct_iface_h tl_iface, unsigned flags,
+                                 uct_completion_t *comp)
+{
+    uct_cxl_fence();
+    UCT_TL_IFACE_STAT_FLUSH(ucs_derived_of(tl_iface, uct_base_iface_t));
+    return UCS_OK;
+}
+
 static int uct_cxl_iface_poll_one(uct_cxl_iface_t *iface)
 {
     uint64_t tail             = iface->rx.tail;
@@ -89,7 +106,7 @@ uct_cxl_iface_query(uct_iface_h tl_iface, uct_iface_attr_t *iface_attr)
                             UCT_IFACE_FLAG_PUT_BCOPY |
                             UCT_IFACE_FLAG_GET_BCOPY | UCT_IFACE_FLAG_AM_SHORT |
                             UCT_IFACE_FLAG_AM_BCOPY | UCT_IFACE_FLAG_PENDING |
-                            UCT_IFACE_FLAG_CB_SYNC |
+                            UCT_IFACE_FLAG_CB_SYNC | UCT_IFACE_FLAG_INTER_NODE |
                             UCT_IFACE_FLAG_CONNECT_TO_IFACE;
     iface_attr->iface_addr_len    = sizeof(uct_cxl_iface_addr_t);
     iface_attr->device_addr_len   = 0;
@@ -191,15 +208,15 @@ static uct_iface_ops_t uct_cxl_iface_ops = {
                 ucs_empty_function_return_unsupported,
         .ep_atomic32_fetch = (uct_ep_atomic32_fetch_func_t)
                 ucs_empty_function_return_unsupported,
-        .ep_flush = uct_base_ep_flush,
-        .ep_fence = uct_base_ep_fence,
+        .ep_flush = uct_cxl_ep_flush,
+        .ep_fence = uct_cxl_ep_fence,
         .ep_check = (uct_ep_check_func_t)ucs_empty_function_return_success,
         .ep_pending_add           = uct_cxl_ep_pending_add,
         .ep_pending_purge         = uct_cxl_ep_pending_purge,
         .ep_create                = UCS_CLASS_NEW_FUNC_NAME(uct_cxl_ep_t),
         .ep_destroy               = UCS_CLASS_DELETE_FUNC_NAME(uct_cxl_ep_t),
-        .iface_flush              = uct_base_iface_flush,
-        .iface_fence              = uct_base_iface_fence,
+        .iface_flush              = uct_cxl_iface_flush,
+        .iface_fence              = uct_cxl_iface_fence,
         .iface_progress_enable    = uct_base_iface_progress_enable,
         .iface_progress_disable   = uct_base_iface_progress_disable,
         .iface_progress           = uct_cxl_iface_progress,

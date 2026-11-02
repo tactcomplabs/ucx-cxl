@@ -219,3 +219,20 @@ ucs_status_t uct_cxl_ep_get_bcopy(uct_ep_h tl_ep,
     UCT_TL_EP_STAT_OP(ucs_derived_of(tl_ep, uct_base_ep_t), GET, BCOPY, length);
     return UCS_OK;
 }
+
+ucs_status_t uct_cxl_ep_fence(uct_ep_h tl_ep, unsigned flags)
+{
+    uct_cxl_fence();
+    UCT_TL_EP_STAT_FENCE(ucs_derived_of(tl_ep, uct_base_ep_t));
+    return UCS_OK;
+}
+
+/* Puts complete synchronously, so ordering them is enough for remote
+ * completion; comp is never used */
+ucs_status_t
+uct_cxl_ep_flush(uct_ep_h tl_ep, unsigned flags, uct_completion_t *comp)
+{
+    uct_cxl_fence();
+    UCT_TL_EP_STAT_FLUSH(ucs_derived_of(tl_ep, uct_base_ep_t));
+    return UCS_OK;
+}

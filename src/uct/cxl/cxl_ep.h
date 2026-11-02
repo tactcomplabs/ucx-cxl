@@ -34,4 +34,8 @@ uct_cxl_ep_pending_add(uct_ep_h tl_ep, uct_pending_req_t *req, unsigned flags);
 void uct_cxl_ep_pending_purge(uct_ep_h tl_ep, uct_pending_purge_callback_t cb,
                               void *arg);
 
+ucs_status_t uct_cxl_ep_fence(uct_ep_h tl_ep, unsigned flags);
+ucs_status_t
+uct_cxl_ep_flush(uct_ep_h tl_ep, unsigned flags, uct_completion_t *comp);
+
 #endif

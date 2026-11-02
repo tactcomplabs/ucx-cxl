@@ -19,8 +19,7 @@
 /* Fixed partition of the CXL aperture - identical on both peers, compiled in,
  * not negotiated at runtime */
 #define UCT_CXL_CTRL_OFFSET 0
-#define UCT_CXL_CTRL_SIZE                                                      \
-    ucs_align_up(sizeof(uct_cxl_ctrl_t), UCT_CXL_ALIGN)
+#define UCT_CXL_CTRL_SIZE   ucs_align_up(sizeof(uct_cxl_ctrl_t), UCT_CXL_ALIGN)
 
 /* FIFO parameters */
 #define UCT_CXL_FIFO_ELEM_SIZE 256

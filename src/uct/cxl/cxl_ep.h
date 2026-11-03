@@ -19,6 +19,10 @@ ssize_t uct_cxl_ep_put_bcopy(uct_ep_h, uct_pack_callback_t, void *, uint64_t,
 ucs_status_t uct_cxl_ep_get_bcopy(uct_ep_h, uct_unpack_callback_t, void *,
                                   size_t, uint64_t, uct_rkey_t,
                                   uct_completion_t *);
+ucs_status_t uct_cxl_ep_put_zcopy(uct_ep_h, const uct_iov_t *, size_t, uint64_t,
+                                  uct_rkey_t, uct_completion_t *);
+ucs_status_t uct_cxl_ep_get_zcopy(uct_ep_h, const uct_iov_t *, size_t, uint64_t,
+                                  uct_rkey_t, uct_completion_t *);
 ucs_status_t
 uct_cxl_ep_am_short(uct_ep_h, uint8_t, uint64_t, const void *, unsigned);
 ssize_t

@@ -276,6 +276,10 @@ static ucs_status_t uct_cxl_md_query(uct_md_h tl_md, uct_md_attr_v2_t *attr)
     attr->flags            = UCT_MD_FLAG_ALLOC | UCT_MD_FLAG_NEED_RKEY;
     attr->alloc_mem_types  = UCS_BIT(UCS_MEMORY_TYPE_HOST);
     attr->access_mem_types = UCS_BIT(UCS_MEMORY_TYPE_HOST);
+    /* Wireup gives an RMA_BW lane to an MD with NEED_RKEY only if
+     * reg_mem_types covers the memory type. UCP registers only on MDs with
+     * UCT_MD_FLAG_REG, so this alone never routes mem_reg to this MD. */
+    attr->reg_mem_types    = UCS_BIT(UCS_MEMORY_TYPE_HOST);
     attr->max_alloc        = uct_cxl_md_rma_size(md->aperture_size);
     attr->max_reg          = 0;
     attr->rkey_packed_size = sizeof(uct_cxl_packed_rkey_t);

@@ -2,7 +2,9 @@
 #include "cxl_iface.h"
 #include "cxl_md.h"
 #include "cxl_io.h"
+#include <uct/base/uct_iov.inl>
 #include <inttypes.h>
+#include <stdbool.h>
 
 static UCS_CLASS_INIT_FUNC(uct_cxl_ep_t, const uct_ep_params_t *params)
 {
@@ -217,6 +219,80 @@ ucs_status_t uct_cxl_ep_get_bcopy(uct_ep_h tl_ep,
     ucs_trace_data("GET_BCOPY [length %zu] from 0x%" PRIx64, length,
                    remote_addr);
     UCT_TL_EP_STAT_OP(ucs_derived_of(tl_ep, uct_base_ep_t), GET, BCOPY, length);
+    return UCS_OK;
+}
+
+/* Copy between the iov buffers and [remote_addr, +total) of the peer's segment.
+ * The CPU does the copy, so zcopy only skips the bounce buffer. The MD needs
+ * no memh, so the iov memh is ignored. */
+static UCS_F_ALWAYS_INLINE ucs_status_t uct_cxl_ep_rma_zcopy(
+        uct_ep_h tl_ep, const uct_iov_t *iov, size_t iovcnt,
+        uint64_t remote_addr, uct_rkey_t rkey, bool is_put, size_t *length_p)
+{
+    uct_cxl_iface_t *iface = ucs_derived_of(tl_ep->iface, uct_cxl_iface_t);
+    size_t total           = uct_iov_total_length(iov, iovcnt);
+    ucs_status_t status;
+    size_t i, length;
+    void *mmio;
+
+    status = uct_cxl_ep_rma_ptr(iface, remote_addr, rkey, total, &mmio);
+    if (status != UCS_OK) {
+        return status;
+    }
+
+    for (i = 0; i < iovcnt; i++) {
+        length = uct_iov_get_length(&iov[i]);
+        if (is_put) {
+            uct_cxl_io_write(mmio, iov[i].buffer, length);
+        } else {
+            uct_cxl_io_read(iov[i].buffer, mmio, length);
+        }
+        mmio = UCS_PTR_BYTE_OFFSET(mmio, length);
+    }
+
+    *length_p = total;
+    return UCS_OK;
+}
+
+/* Each access waits for the peer, so both complete before returning and comp
+ * is never used */
+ucs_status_t uct_cxl_ep_put_zcopy(uct_ep_h tl_ep, const uct_iov_t *iov,
+                                  size_t iovcnt, uint64_t remote_addr,
+                                  uct_rkey_t rkey, uct_completion_t *comp)
+{
+    ucs_status_t status;
+    size_t length;
+
+    UCT_CHECK_IOV_SIZE(iovcnt, (size_t)UCT_CXL_RMA_MAX_IOV, "put_zcopy");
+
+    status = uct_cxl_ep_rma_zcopy(tl_ep, iov, iovcnt, remote_addr, rkey, true,
+                                  &length);
+    if (status != UCS_OK) {
+        return status;
+    }
+
+    ucs_trace_data("PUT_ZCOPY [size %zu] to 0x%" PRIx64, length, remote_addr);
+    UCT_TL_EP_STAT_OP(ucs_derived_of(tl_ep, uct_base_ep_t), PUT, ZCOPY, length);
+    return UCS_OK;
+}
+
+ucs_status_t uct_cxl_ep_get_zcopy(uct_ep_h tl_ep, const uct_iov_t *iov,
+                                  size_t iovcnt, uint64_t remote_addr,
+                                  uct_rkey_t rkey, uct_completion_t *comp)
+{
+    ucs_status_t status;
+    size_t length;
+
+    UCT_CHECK_IOV_SIZE(iovcnt, (size_t)UCT_CXL_RMA_MAX_IOV, "get_zcopy");
+
+    status = uct_cxl_ep_rma_zcopy(tl_ep, iov, iovcnt, remote_addr, rkey, false,
+                                  &length);
+    if (status != UCS_OK) {
+        return status;
+    }
+
+    ucs_trace_data("GET_ZCOPY [size %zu] from 0x%" PRIx64, length, remote_addr);
+    UCT_TL_EP_STAT_OP(ucs_derived_of(tl_ep, uct_base_ep_t), GET, ZCOPY, length);
     return UCS_OK;
 }
 

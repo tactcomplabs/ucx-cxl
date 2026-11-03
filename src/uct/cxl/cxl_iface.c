@@ -102,9 +102,13 @@ uct_cxl_iface_query(uct_iface_h tl_iface, uct_iface_attr_t *iface_attr)
     uct_cxl_iface_t *iface = ucs_derived_of(tl_iface, uct_cxl_iface_t);
 
     uct_base_iface_query(&iface->super, iface_attr);
+    /* Wireup gives an iface an RMA_BW lane, which put/get bcopy need, only if
+     * it supports put or get zcopy */
     iface_attr->cap.flags = UCT_IFACE_FLAG_PUT_SHORT |
                             UCT_IFACE_FLAG_PUT_BCOPY |
-                            UCT_IFACE_FLAG_GET_BCOPY | UCT_IFACE_FLAG_AM_SHORT |
+                            UCT_IFACE_FLAG_PUT_ZCOPY |
+                            UCT_IFACE_FLAG_GET_BCOPY |
+                            UCT_IFACE_FLAG_GET_ZCOPY | UCT_IFACE_FLAG_AM_SHORT |
                             UCT_IFACE_FLAG_AM_BCOPY | UCT_IFACE_FLAG_PENDING |
                             UCT_IFACE_FLAG_CB_SYNC | UCT_IFACE_FLAG_INTER_NODE |
                             UCT_IFACE_FLAG_CONNECT_TO_IFACE;
@@ -115,6 +119,15 @@ uct_cxl_iface_query(uct_iface_h tl_iface, uct_iface_attr_t *iface_attr)
     iface_attr->cap.put.max_short = UCT_CXL_RMA_MAX_SHORT;
     iface_attr->cap.put.max_bcopy = UCT_CXL_RMA_MAX_BCOPY;
     iface_attr->cap.get.max_bcopy = UCT_CXL_RMA_MAX_BCOPY;
+    /* rkey bounds-check zcopy against the segment, so no size limit here */
+    iface_attr->cap.put.max_zcopy       = SIZE_MAX;
+    iface_attr->cap.put.opt_zcopy_align = 1;
+    iface_attr->cap.put.align_mtu       = 1;
+    iface_attr->cap.put.max_iov         = UCT_CXL_RMA_MAX_IOV;
+    iface_attr->cap.get.max_zcopy       = SIZE_MAX;
+    iface_attr->cap.get.opt_zcopy_align = 1;
+    iface_attr->cap.get.align_mtu       = 1;
+    iface_attr->cap.get.max_iov         = UCT_CXL_RMA_MAX_IOV;
     /* am_short carries an uint64_t header within its payload */
     iface_attr->cap.am.max_short = UCT_CXL_FIFO_PAYLOAD_SIZE - sizeof(uint64_t);
     iface_attr->cap.am.max_bcopy = UCT_CXL_FIFO_PAYLOAD_SIZE;
@@ -192,6 +205,8 @@ static uct_iface_ops_t uct_cxl_iface_ops = {
         .ep_put_short    = uct_cxl_ep_put_short,
         .ep_put_bcopy    = uct_cxl_ep_put_bcopy,
         .ep_get_bcopy    = uct_cxl_ep_get_bcopy,
+        .ep_put_zcopy    = uct_cxl_ep_put_zcopy,
+        .ep_get_zcopy    = uct_cxl_ep_get_zcopy,
         .ep_am_short     = uct_cxl_ep_am_short,
         .ep_am_short_iov = (uct_ep_am_short_iov_func_t)
                 ucs_empty_function_return_unsupported,

@@ -1,13 +1,17 @@
+#ifdef HAVE_CONFIG_H
+#include "config.h"
+#endif
+
 #include <uct/base/uct_component.h>
 #include <ucs/debug/log.h>
 #include <ucs/debug/memtrack_int.h>
 #include <ucs/sys/compiler_def.h>
+#include <ucs/sys/string.h>
+#include <ucs/sys/sys.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <sys/file.h>
 #include <sys/mman.h>
 #include <unistd.h>
-#include <stdbool.h>
 #include <inttypes.h>
 #include "cxl_md.h"
 
@@ -31,14 +35,36 @@ static ucs_config_field_t uct_cxl_md_config_table[] = {
          ucs_offsetof(uct_cxl_md_config_t, aperture_size),
          UCS_CONFIG_TYPE_MEMUNITS},
 
+        {"SLOTS", "4",
+         "Number of slots each memdev is split into; one UCX process per guest "
+         "owns each slot. Must be the same on both guests, at "
+         "most " UCS_PP_MAKE_STRING(UCT_CXL_MAX_SLOTS) ".",
+         ucs_offsetof(uct_cxl_md_config_t, nslots), UCS_CONFIG_TYPE_ULUNITS},
+
+        {"SLOT", "auto",
+         "Slot of the local memdev to own. \"auto\" takes the first one no "
+         "other process holds.",
+         ucs_offsetof(uct_cxl_md_config_t, slot), UCS_CONFIG_TYPE_ULUNITS},
+
+        {"NODE_ID", "auto",
+         "Identifier of this guest. Peers with the same identifier are not "
+         "reachable over cxl. \"auto\" uses the machine GUID.",
+         ucs_offsetof(uct_cxl_md_config_t, node_id), UCS_CONFIG_TYPE_ULUNITS},
+
         {NULL}};
 
-/* Get RMA region size, potentially rounding down to satisfy alignment requirements */
-static size_t uct_cxl_md_rma_size(size_t aperture_size)
+/* Size of the RMA region of each slot */
+static size_t uct_cxl_md_rma_size(const uct_cxl_md_t *md)
 {
-    UCS_STATIC_ASSERT((UCT_CXL_RMA_OFFSET % UCT_CXL_ALIGN) == 0);
-    return ucs_align_down_pow2(aperture_size, UCT_CXL_ALIGN) -
-           UCT_CXL_RMA_OFFSET;
+    return md->slot_size - UCT_CXL_RMA_OFFSET;
+}
+
+/* Whether [offset, offset + length) lies within this MD's own RMA region */
+static bool uct_cxl_md_is_own_rma_range(const uct_cxl_md_t *md, uint64_t offset,
+                                        uint64_t length)
+{
+    return uct_cxl_md_is_rma_range(md, offset, length) &&
+           ((offset / md->slot_size) == md->slot);
 }
 
 static ucs_status_t
@@ -67,9 +93,9 @@ uct_cxl_mem_alloc(uct_md_h tl_md, size_t *length_p, void **address_p,
     }
 
     /* Also guards ucs_align_up_pow2 below against overflow */
-    if (*length_p > md->aperture_size) {
-        ucs_debug("cxl: %zu bytes for %s exceed the %zu byte aperture",
-                  *length_p, alloc_name, md->aperture_size);
+    if (*length_p > uct_cxl_md_rma_size(md)) {
+        ucs_debug("cxl: %zu bytes for %s exceed the slot's %zu byte RMA region",
+                  *length_p, alloc_name, uct_cxl_md_rma_size(md));
         return UCS_ERR_NO_MEMORY;
     }
 
@@ -133,8 +159,7 @@ static ucs_status_t uct_cxl_mem_free(uct_md_h tl_md, uct_mem_h memh)
     uct_cxl_seg_t *next = NULL;
     uct_cxl_seg_t *range;
 
-    ucs_assertv((seg->offset >= UCT_CXL_RMA_OFFSET) &&
-                        (seg->offset + seg->length <= md->aperture_size),
+    ucs_assertv(uct_cxl_md_is_own_rma_range(md, seg->offset, seg->length),
                 "seg=[0x%" PRIx64 ", 0x%" PRIx64 ")", seg->offset,
                 seg->offset + seg->length);
 
@@ -193,8 +218,7 @@ uct_cxl_mkey_pack(uct_md_h tl_md, uct_mem_h memh, void *address, size_t length,
     size_t offset  = UCS_PTR_BYTE_DIFF(seg_base, address);
 
     /* Is this segment inside the RMA range (i.e. from uct_cxl_alloc)? */
-    ucs_assertv((seg->offset >= UCT_CXL_RMA_OFFSET) &&
-                        (seg->offset + seg->length <= md->aperture_size),
+    ucs_assertv(uct_cxl_md_is_own_rma_range(md, seg->offset, seg->length),
                 "seg=[0x%" PRIx64 ", 0x%" PRIx64 ")", seg->offset,
                 seg->offset + seg->length);
 
@@ -219,7 +243,7 @@ static ucs_status_t uct_cxl_rkey_unpack(uct_component_t *component,
     const uct_cxl_packed_rkey_t *packed_rkey = rkey_buffer;
     uct_cxl_rkey_t *rkey;
 
-    /* The aperture bound is checked by put/get, which have the MD */
+    /* Slot and aperture bounds are checked by put/get, which have the MD */
     if ((packed_rkey->seg_offset < UCT_CXL_RMA_OFFSET) ||
         (packed_rkey->length > UINT64_MAX - packed_rkey->seg_offset)) {
         ucs_error("cxl: invalid rkey: offset 0x%" PRIx64 " length %" PRIu64,
@@ -280,7 +304,7 @@ static ucs_status_t uct_cxl_md_query(uct_md_h tl_md, uct_md_attr_v2_t *attr)
      * reg_mem_types covers the memory type. UCP registers only on MDs with
      * UCT_MD_FLAG_REG, so this alone never routes mem_reg to this MD. */
     attr->reg_mem_types    = UCS_BIT(UCS_MEMORY_TYPE_HOST);
-    attr->max_alloc        = uct_cxl_md_rma_size(md->aperture_size);
+    attr->max_alloc        = uct_cxl_md_rma_size(md);
     attr->max_reg          = 0;
     attr->rkey_packed_size = sizeof(uct_cxl_packed_rkey_t);
 
@@ -293,14 +317,9 @@ static void uct_cxl_md_unmap_device(void *address, size_t length, int fd)
     close(fd);
 }
 
-/* With 'exclusive', take a non-blocking exclusive flock() on the device. It is
- * held for as long as fd stays open, so the caller must keep fd open for the
- * lifetime of the mapping. */
 static ucs_status_t uct_cxl_md_map_device(const char *file_name, size_t length,
-                                          bool exclusive, void **address_p,
-                                          int *fd_p)
+                                          void **address_p, int *fd_p)
 {
-    ucs_status_t status;
     void *address;
     int fd;
 
@@ -310,37 +329,82 @@ static ucs_status_t uct_cxl_md_map_device(const char *file_name, size_t length,
         return UCS_ERR_NO_DEVICE;
     }
 
-    if (exclusive && (flock(fd, LOCK_EX | LOCK_NB) != 0)) {
-        if (errno == EWOULDBLOCK) {
-            /* UCP skips an MD that fails to open without logging, so say why
-             * the transport disappeared */
-            ucs_error("cxl: %s is in use by another UCX memory domain (in "
-                      "this or another process); only one may own it",
-                      file_name);
-            status = UCS_ERR_BUSY;
-        } else {
-            ucs_error("cxl: failed to lock %s: %m", file_name);
-            status = UCS_ERR_IO_ERROR;
-        }
-        goto err_close;
-    }
-
     /* The driver installs uncached/device PTEs, so accesses are not cached or
      * merged (and on the peer window, every access traps to the peer) */
     address = mmap(NULL, length, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (address == MAP_FAILED) {
         ucs_error("cxl: failed to mmap %zu bytes of %s: %m", length, file_name);
-        status = UCS_ERR_IO_ERROR;
-        goto err_close;
+        close(fd);
+        return UCS_ERR_IO_ERROR;
     }
 
     *address_p = address;
     *fd_p      = fd;
     return UCS_OK;
+}
 
-err_close:
-    close(fd);
-    return status;
+/* Take a non-blocking open file description lock on byte 'slot' of fd. It is
+ * held until fd is closed, including when the process dies, and it conflicts
+ * with locks taken through other open() calls, even in the same process. */
+static ucs_status_t uct_cxl_md_try_lock_slot(int fd, unsigned slot)
+{
+    struct flock lock = {
+            .l_type   = F_WRLCK,
+            .l_whence = SEEK_SET,
+            .l_start  = slot,
+            .l_len    = 1,
+            .l_pid    = 0 /* required by F_OFD_SETLK */
+    };
+
+    if (fcntl(fd, F_OFD_SETLK, &lock) == 0) {
+        return UCS_OK;
+    }
+
+    if ((errno == EAGAIN) || (errno == EACCES)) {
+        return UCS_ERR_BUSY;
+    }
+
+    ucs_error("cxl: failed to lock slot %u: %m", slot);
+    return UCS_ERR_IO_ERROR;
+}
+
+/* Own the configured slot, or the first free one if it is "auto" */
+static ucs_status_t
+uct_cxl_md_lock_slot(uct_cxl_md_t *md, const uct_cxl_md_config_t *config)
+{
+    ucs_status_t status;
+    unsigned slot;
+
+    /* User requested a particular slot */
+    if (config->slot != UCS_ULUNITS_AUTO) {
+        status = uct_cxl_md_try_lock_slot(md->local_fd, config->slot);
+        if (status == UCS_OK) {
+            md->slot = config->slot;
+        } else if (status == UCS_ERR_BUSY) {
+            ucs_error("cxl: slot %lu of %s is in use by another UCX memory "
+                      "domain (in this or another process)",
+                      config->slot, config->local_dev_path);
+        }
+        return status;
+    }
+
+    /* Auto mode, pick first available */
+    for (slot = 0; slot < md->nslots; slot++) {
+        status = uct_cxl_md_try_lock_slot(md->local_fd, slot);
+        if (status == UCS_OK) {
+            md->slot = slot;
+            return UCS_OK;
+        } else if (status != UCS_ERR_BUSY) {
+            return status;
+        }
+    }
+
+    /* UCP skips an MD that fails to open without logging, so say why the
+     * transport disappeared */
+    ucs_error("cxl: all %u slots of %s are in use by other UCX memory "
+              "domains (in this or other processes)",
+              md->nslots, config->local_dev_path);
+    return UCS_ERR_BUSY;
 }
 
 /* Deallocate all free memory regions in the RMA range */
@@ -355,10 +419,10 @@ static void uct_cxl_md_free_list_cleanup(uct_cxl_md_t *md)
         ucs_free(range);
     }
 
-    if (free_bytes != uct_cxl_md_rma_size(md->aperture_size)) {
+    if (free_bytes != uct_cxl_md_rma_size(md)) {
         ucs_warn("cxl: md %p closed with %zu bytes of RMA region still "
                  "allocated",
-                 md, uct_cxl_md_rma_size(md->aperture_size) - free_bytes);
+                 md, uct_cxl_md_rma_size(md) - free_bytes);
     }
 }
 
@@ -401,6 +465,7 @@ uct_cxl_md_open(uct_component_t *component, const char *md_name,
     uct_cxl_seg_t *range;
     uct_cxl_md_t *md;
     ucs_status_t status;
+    size_t slot_size;
 
     /* Unrelated to opening, but UCS_STATIC_ASSERT needs function scope */
     UCS_STATIC_ASSERT(sizeof(uct_cxl_fifo_elem_t) == UCT_CXL_FIFO_ELEM_SIZE);
@@ -409,10 +474,31 @@ uct_cxl_md_open(uct_component_t *component, const char *md_name,
     UCS_STATIC_ASSERT((ucs_offsetof(uct_cxl_ctrl_t, ack) % 8) == 0);
     UCS_STATIC_ASSERT((UCT_CXL_FIFO_OFFSET % UCT_CXL_ALIGN) == 0);
 
-    if (config->aperture_size < UCT_CXL_RMA_OFFSET + UCT_CXL_ALIGN) {
-        ucs_error("cxl: aperture size %zu is too small for the control block, "
-                  "FIFO and RMA region (need at least %zu bytes)",
-                  config->aperture_size,
+    UCS_STATIC_ASSERT((UCT_CXL_RMA_OFFSET % UCT_CXL_ALIGN) == 0);
+
+    /* Is the number of slots we're reporting allowed? */
+    if ((config->nslots == 0) || (config->nslots > UCT_CXL_MAX_SLOTS)) {
+        ucs_error("cxl: number of slots must be between 1 and %d, got %lu",
+                  UCT_CXL_MAX_SLOTS, config->nslots);
+        return UCS_ERR_INVALID_PARAM;
+    }
+
+    /* Is the requested slot in range, assuming no auto-picking? */
+    if ((config->slot != UCS_ULUNITS_AUTO) &&
+        (config->slot >= config->nslots)) {
+        ucs_error("cxl: slot %lu is out of range for %lu slots", config->slot,
+                  config->nslots);
+        return UCS_ERR_INVALID_PARAM;
+    }
+
+    /* Is the calculated slot size large enough to hold the control + FIFO? */
+    slot_size = ucs_align_down_pow2(config->aperture_size / config->nslots,
+                                    UCT_CXL_ALIGN);
+    if (slot_size < UCT_CXL_RMA_OFFSET + UCT_CXL_ALIGN) {
+        ucs_error("cxl: aperture size %zu is too small for %lu slots, each "
+                  "with a control block, FIFOs and RMA region (need at least "
+                  "%zu bytes per slot)",
+                  config->aperture_size, config->nslots,
                   (size_t)(UCT_CXL_RMA_OFFSET + UCT_CXL_ALIGN));
         return UCS_ERR_INVALID_PARAM;
     }
@@ -423,19 +509,29 @@ uct_cxl_md_open(uct_component_t *component, const char *md_name,
         return UCS_ERR_NO_MEMORY;
     }
 
+    md->nslots    = config->nslots;
+    md->slot_size = slot_size;
+    md->node_id   = (config->node_id == UCS_ULUNITS_AUTO) ? ucs_machine_guid() :
+                                                            config->node_id;
+
     status = uct_cxl_md_map_device(config->accel_dev_path,
-                                   config->aperture_size, false,
-                                   &md->aperture_base, &md->aperture_fd);
+                                   config->aperture_size, &md->aperture_base,
+                                   &md->aperture_fd);
     if (status != UCS_OK) {
         goto err_free_md;
     }
 
-    /* The free list assumes it is the only allocator of the local memdev */
     status = uct_cxl_md_map_device(config->local_dev_path,
-                                   config->aperture_size, true, &md->local_base,
+                                   config->aperture_size, &md->local_base,
                                    &md->local_fd);
     if (status != UCS_OK) {
         goto err_unmap_aperture;
+    }
+
+    /* The free list assumes it is the only allocator of its slot */
+    status = uct_cxl_md_lock_slot(md, config);
+    if (status != UCS_OK) {
+        goto err_unmap_local;
     }
 
     status = ucs_spinlock_init(&md->lock, 0);
@@ -452,8 +548,8 @@ uct_cxl_md_open(uct_component_t *component, const char *md_name,
         goto err_destroy_lock;
     }
 
-    range->offset = UCT_CXL_RMA_OFFSET;
-    range->length = uct_cxl_md_rma_size(config->aperture_size);
+    range->offset = uct_cxl_md_slot_offset(md, md->slot) + UCT_CXL_RMA_OFFSET;
+    range->length = uct_cxl_md_rma_size(md);
     ucs_list_head_init(&md->free_list);
     ucs_list_add_tail(&md->free_list, &range->list);
 

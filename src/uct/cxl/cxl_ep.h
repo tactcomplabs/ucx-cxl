@@ -3,10 +3,10 @@
 
 #include <uct/base/uct_iface.h>
 #include <uct/base/uct_md.h>
-#include "cxl_iface.h"
 
 typedef struct uct_cxl_ep {
     uct_base_ep_t super;
+    unsigned remote_slot; /* peer slot this EP sends to */
 } uct_cxl_ep_t;
 
 UCS_CLASS_DECLARE_NEW_FUNC(uct_cxl_ep_t, uct_ep_t, const uct_ep_params_t *);

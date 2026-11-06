@@ -28,21 +28,39 @@ ucs_status_t uct_cxl_iface_fence(uct_iface_h tl_iface, unsigned flags)
     return UCS_OK;
 }
 
-/* Puts complete synchronously, so ordering them is enough for remote
- * completion; comp is never used */
+/* Puts complete synchronously, and an AM is delivered once its element is in
+ * the peer's ring, so ordering them is enough for remote completion. Sends
+ * waiting in a pending queue are still outstanding: UCP doesn't count them as
+ * in flight, and completes a worker flush as soon as every iface reports
+ * UCS_OK. There's nothing to signal later, so comp isn't supported. */
 ucs_status_t uct_cxl_iface_flush(uct_iface_h tl_iface, unsigned flags,
                                  uct_completion_t *comp)
 {
+    uct_cxl_iface_t *iface = ucs_derived_of(tl_iface, uct_cxl_iface_t);
+    unsigned slot;
+
+    if (comp != NULL) {
+        return UCS_ERR_UNSUPPORTED;
+    }
+
+    for (slot = 0; slot < iface->md->nslots; ++slot) {
+        if (!ucs_queue_is_empty(&iface->tx[slot].pending)) {
+            return UCS_INPROGRESS;
+        }
+    }
+
     uct_cxl_fence();
     UCT_TL_IFACE_STAT_FLUSH(ucs_derived_of(tl_iface, uct_base_iface_t));
     return UCS_OK;
 }
 
-static int uct_cxl_iface_poll_one(uct_cxl_iface_t *iface)
+/* Receive one element from the ring written by peer slot 'sender' */
+static int uct_cxl_iface_poll_one(uct_cxl_iface_t *iface, unsigned sender)
 {
-    uint64_t tail             = iface->rx.tail;
+    uint64_t tail             = iface->rx[sender].tail;
     unsigned idx              = tail % UCT_CXL_FIFO_DEPTH;
-    uct_cxl_fifo_elem_t *elem = &iface->rx.fifo[idx];
+    uct_cxl_fifo_elem_t *elem = &iface->rx[sender].fifo[idx];
+    uct_cxl_ctrl_t *peer_ctrl;
     uint8_t buf[UCT_CXL_FIFO_PAYLOAD_SIZE];
     uint64_t meta;
     uint32_t length;
@@ -59,39 +77,60 @@ static int uct_cxl_iface_poll_one(uct_cxl_iface_t *iface)
     length = (uint32_t)meta;
     am_id  = (uint8_t)(meta >> 32);
     if ((length > UCT_CXL_FIFO_PAYLOAD_SIZE) || (am_id >= UCT_AM_ID_MAX)) {
-        ucs_fatal("cxl: corrupt FIFO element %" PRIu64 ": length %u am_id %u",
-                  tail, length, am_id);
+        ucs_fatal("cxl: corrupt FIFO element %" PRIu64 " from slot %u: length "
+                  "%u am_id %u",
+                  tail, sender, length, am_id);
     }
     uct_cxl_io_read(buf, elem->payload, length);
 
     uct_cxl_fence(); /* F4: contents copied out before releasing the slot */
-    uct_cxl_io_write64(&iface->remote_ctrl->ack[idx], tail + 1);
-    iface->rx.tail = tail + 1;
+
+    peer_ctrl = iface->rx[sender].peer_ctrl;
+    uct_cxl_io_write64(&peer_ctrl->ack[iface->md->slot][idx], tail + 1);
+    iface->rx[sender].tail = tail + 1;
 
     /* State is consistent, so the handler may send */
     uct_iface_invoke_am(&iface->super, am_id, buf, length, 0);
     return 1;
 }
 
+/* Dispatch one transmission from every non-empty slot */
 static void uct_cxl_iface_dispatch_pending(uct_cxl_iface_t *iface)
 {
     uct_cxl_pending_req_priv_t *priv;
+    unsigned slot;
 
-    iface->tx.dispatching = 1;
-    uct_pending_queue_dispatch(priv, &iface->tx.pending,
-                               uct_cxl_iface_tx_slot_free(iface));
-    iface->tx.dispatching = 0;
+    for (slot = 0; slot < iface->md->nslots; ++slot) {
+        if (ucs_queue_is_empty(&iface->tx[slot].pending)) {
+            continue;
+        }
+
+        iface->tx[slot].dispatching = true;
+        uct_pending_queue_dispatch(priv, &iface->tx[slot].pending,
+                                   uct_cxl_iface_tx_slot_free(iface, slot));
+        iface->tx[slot].dispatching = false;
+    }
 }
 
+/* Receive at most UCT_CXL_FIFO_DEPTH requests, starting from slot `first` */
 static unsigned uct_cxl_iface_progress(uct_iface_h tl_iface)
 {
     uct_cxl_iface_t *iface = ucs_derived_of(tl_iface, uct_cxl_iface_t);
+    unsigned nslots        = iface->md->nslots;
+    unsigned first         = iface->rx_next;
     unsigned count         = 0;
+    unsigned i, sender;
 
-    while ((count < UCT_CXL_FIFO_DEPTH) && uct_cxl_iface_poll_one(iface)) {
-        ++count;
+    /* Rings are in local memory, so polling the idle ones is cheap */
+    for (i = 0; i < nslots; ++i) {
+        sender = (first + i) % nslots;
+        while ((count < UCT_CXL_FIFO_DEPTH) &&
+               uct_cxl_iface_poll_one(iface, sender)) {
+            ++count;
+        }
     }
 
+    iface->rx_next = (first + 1) % nslots;
     uct_cxl_iface_dispatch_pending(iface);
     return count;
 }
@@ -113,7 +152,7 @@ uct_cxl_iface_query(uct_iface_h tl_iface, uct_iface_attr_t *iface_attr)
                             UCT_IFACE_FLAG_CB_SYNC | UCT_IFACE_FLAG_INTER_NODE |
                             UCT_IFACE_FLAG_CONNECT_TO_IFACE;
     iface_attr->iface_addr_len    = sizeof(uct_cxl_iface_addr_t);
-    iface_attr->device_addr_len   = 0;
+    iface_attr->device_addr_len   = sizeof(uct_cxl_device_addr_t);
     iface_attr->ep_addr_len       = 0;
     iface_attr->max_conn_priv     = 0;
     iface_attr->cap.put.max_short = UCT_CXL_RMA_MAX_SHORT;
@@ -146,31 +185,55 @@ uct_cxl_iface_is_reachable_v2(const uct_iface_h tl_iface,
                               const uct_iface_is_reachable_params_t *params)
 {
     uct_cxl_iface_t *iface = ucs_derived_of(tl_iface, uct_cxl_iface_t);
-    uint64_t remote_id;
+    uct_cxl_md_t *md       = iface->md;
+    uct_cxl_iface_addr_t remote;
+    uct_cxl_device_addr_t remote_node;
+    uct_cxl_ctrl_t *peer_ctrl;
 
     if (!uct_iface_is_reachable_params_addrs_valid(params)) {
         return 0;
     }
 
-    if (params->iface_addr == NULL) {
-        uct_iface_fill_info_str_buf(params, "iface address is empty");
+    if ((params->iface_addr == NULL) || (params->device_addr == NULL)) {
+        uct_iface_fill_info_str_buf(params, "address is empty");
         return 0;
     }
 
-    memcpy(&remote_id, params->iface_addr, sizeof(remote_id));
-    if (remote_id == iface->id) {
-        uct_iface_fill_info_str_buf(params, "loopback is not supported");
+    /* Addresses may be unaligned */
+    memcpy(&remote, params->iface_addr, sizeof(remote));
+    memcpy(&remote_node, params->device_addr, sizeof(remote_node));
+
+    /* Processes on the same guest can only reach each other's memdev slots
+     * through the local mapping, which this transport doesn't send through */
+    if (remote_node == md->node_id) {
+        uct_iface_fill_info_str_buf(params, "peer is on the same node");
         return 0;
     }
 
-    /* All cheap checks have passed, subsequent checks go over socket */
-    if (uct_cxl_io_read64(&iface->remote_ctrl->magic) != UCT_CXL_MAGIC) {
+    if (!uct_iface_scope_is_reachable(tl_iface, params)) {
+        return 0;
+    }
+
+    if (remote.slot >= md->nslots) {
+        uct_iface_fill_info_str_buf(params, "peer slot is out of range");
+        return 0;
+    }
+
+    /* All cheap checks have passed, the rest go over the link */
+    peer_ctrl = uct_cxl_md_ctrl(md, md->aperture_base, remote.slot);
+    if (uct_cxl_io_read64(&peer_ctrl->magic) != UCT_CXL_MAGIC) {
         uct_iface_fill_info_str_buf(params, "peer iface is not initialized");
         return 0;
     }
 
-    if (uct_cxl_io_read64(&iface->remote_ctrl->iface_id) != remote_id) {
+    if (uct_cxl_io_read64(&peer_ctrl->iface_id) != remote.id) {
         uct_iface_fill_info_str_buf(params, "address is not the linked peer");
+        return 0;
+    }
+
+    if ((uct_cxl_io_read64(&peer_ctrl->nslots) != md->nslots) ||
+        (uct_cxl_io_read64(&peer_ctrl->slot_size) != md->slot_size)) {
+        uct_iface_fill_info_str_buf(params, "peer has a different slot layout");
         return 0;
     }
 
@@ -181,7 +244,20 @@ static ucs_status_t
 uct_cxl_iface_get_address(uct_iface_h tl_iface, uct_iface_addr_t *addr)
 {
     uct_cxl_iface_t *iface = ucs_derived_of(tl_iface, uct_cxl_iface_t);
-    memcpy(addr, &iface->id, sizeof(iface->id));
+    uct_cxl_iface_addr_t iface_addr;
+
+    iface_addr.id   = iface->id;
+    iface_addr.slot = iface->md->slot;
+    memcpy(addr, &iface_addr, sizeof(iface_addr));
+    return UCS_OK;
+}
+
+static ucs_status_t
+uct_cxl_iface_get_device_address(uct_iface_h tl_iface, uct_device_addr_t *addr)
+{
+    uct_cxl_iface_t *iface = ucs_derived_of(tl_iface, uct_cxl_iface_t);
+
+    memcpy(addr, &iface->md->node_id, sizeof(uct_cxl_device_addr_t));
     return UCS_OK;
 }
 
@@ -237,16 +313,16 @@ static uct_iface_ops_t uct_cxl_iface_ops = {
         .iface_progress           = uct_cxl_iface_progress,
         .iface_close              = UCS_CLASS_DELETE_FUNC_NAME(uct_cxl_iface_t),
         .iface_query              = uct_cxl_iface_query,
-        .iface_get_device_address = (uct_iface_get_device_address_func_t)
-                ucs_empty_function_return_success,
-        .iface_get_address  = uct_cxl_iface_get_address,
-        .iface_is_reachable = uct_base_iface_is_reachable};
+        .iface_get_device_address = uct_cxl_iface_get_device_address,
+        .iface_get_address        = uct_cxl_iface_get_address,
+        .iface_is_reachable       = uct_base_iface_is_reachable};
 
 static UCS_CLASS_INIT_FUNC(uct_cxl_iface_t, uct_md_h md, uct_worker_h worker,
                            const uct_iface_params_t *params,
                            const uct_iface_config_t *tl_config)
 {
     uct_cxl_md_t *cxl_md = ucs_derived_of(md, uct_cxl_md_t);
+    unsigned slot;
     int in_use;
     UCS_CLASS_CALL_SUPER_INIT(uct_base_iface_t, &uct_cxl_iface_ops,
                               &uct_cxl_iface_internal_ops, md, worker, params,
@@ -258,7 +334,7 @@ static UCS_CLASS_INIT_FUNC(uct_cxl_iface_t, uct_md_h md, uct_worker_h worker,
 
     ucs_spin_lock(&cxl_md->lock);
     in_use               = cxl_md->iface_in_use;
-    cxl_md->iface_in_use = 1;
+    cxl_md->iface_in_use = true;
     ucs_spin_unlock(&cxl_md->lock);
     if (in_use) {
         ucs_error("cxl: md %p already has an open interface, only one is "
@@ -270,16 +346,10 @@ static UCS_CLASS_INIT_FUNC(uct_cxl_iface_t, uct_md_h md, uct_worker_h worker,
     UCS_STATIC_ASSERT(ucs_offsetof(uct_cxl_fifo_elem_t, length) == 8);
     UCS_STATIC_ASSERT(ucs_offsetof(uct_cxl_fifo_elem_t, am_id) == 12);
 
-    self->md          = cxl_md;
-    self->tx.fifo     = UCS_PTR_BYTE_OFFSET(cxl_md->aperture_base,
-                                            UCT_CXL_FIFO_OFFSET);
-    self->rx.fifo     = UCS_PTR_BYTE_OFFSET(cxl_md->local_base,
-                                            UCT_CXL_FIFO_OFFSET);
-    self->local_ctrl  = UCS_PTR_BYTE_OFFSET(cxl_md->local_base,
-                                            UCT_CXL_CTRL_OFFSET);
-    self->remote_ctrl = UCS_PTR_BYTE_OFFSET(cxl_md->aperture_base,
-                                            UCT_CXL_CTRL_OFFSET);
-    self->tx.head     = 0;
+    self->md         = cxl_md;
+    self->local_ctrl = uct_cxl_md_ctrl(cxl_md, cxl_md->local_base,
+                                       cxl_md->slot);
+    self->rx_next    = 0;
     /* pack_cb/unpack_cb must not touch the aperture, so stage through here */
     self->rma_bounce = ucs_malloc(UCT_CXL_RMA_MAX_BCOPY, "uct_cxl_rma_bounce");
     if (self->rma_bounce == NULL) {
@@ -290,9 +360,24 @@ static UCS_CLASS_INIT_FUNC(uct_cxl_iface_t, uct_md_h md, uct_worker_h worker,
         return UCS_ERR_NO_MEMORY;
     }
 
-    ucs_queue_head_init(&self->tx.pending);
-    self->tx.dispatching = 0;
-    self->rx.tail        = 0;
+    for (slot = 0; slot < UCT_CXL_MAX_SLOTS; ++slot) {
+        self->tx[slot].fifo        = NULL;
+        self->tx[slot].head        = 0;
+        self->tx[slot].dispatching = 0;
+        ucs_queue_head_init(&self->tx[slot].pending);
+        self->rx[slot].fifo      = NULL;
+        self->rx[slot].peer_ctrl = NULL;
+        self->rx[slot].tail      = 0;
+    }
+
+    for (slot = 0; slot < cxl_md->nslots; ++slot) {
+        self->tx[slot].fifo = uct_cxl_md_get_ring(cxl_md, cxl_md->aperture_base,
+                                                  slot, cxl_md->slot);
+        self->rx[slot].fifo = uct_cxl_md_get_ring(cxl_md, cxl_md->local_base,
+                                                  cxl_md->slot, slot);
+        self->rx[slot].peer_ctrl = uct_cxl_md_ctrl(cxl_md,
+                                                   cxl_md->aperture_base, slot);
+    }
 
     /* Generate unique id for the iface, so it can be correctly
      * identified and loopback is avoided. Avoid troublesome edge
@@ -301,13 +386,16 @@ static UCS_CLASS_INIT_FUNC(uct_cxl_iface_t, uct_md_h md, uct_worker_h worker,
         self->id = ucs_generate_uuid((uintptr_t)self);
     } while (self->id == 0 || self->id == UINT64_MAX);
 
-    /* zero local control block and fifo */
+    /* Zero our slot's control block and rings; other slots belong to other
+     * processes */
     memset(self->local_ctrl, 0, UCT_CXL_CTRL_SIZE);
-    memset(self->rx.fifo, 0, UCT_CXL_FIFO_SIZE);
+    memset(self->rx[0].fifo, 0, UCT_CXL_MAX_SLOTS * UCT_CXL_FIFO_SIZE);
 
     uct_cxl_fence();
 
     uct_cxl_io_write64(&self->local_ctrl->iface_id, self->id);
+    uct_cxl_io_write64(&self->local_ctrl->nslots, cxl_md->nslots);
+    uct_cxl_io_write64(&self->local_ctrl->slot_size, cxl_md->slot_size);
 
     uct_cxl_fence();
 
@@ -320,7 +408,13 @@ static UCS_CLASS_INIT_FUNC(uct_cxl_iface_t, uct_md_h md, uct_worker_h worker,
 
 static UCS_CLASS_CLEANUP_FUNC(uct_cxl_iface_t)
 {
-    ucs_assert(ucs_queue_is_empty(&self->tx.pending));
+    unsigned slot;
+
+    for (slot = 0; slot < UCT_CXL_MAX_SLOTS; ++slot) {
+        ucs_assertv(ucs_queue_is_empty(&self->tx[slot].pending), "slot=%u",
+                    slot);
+    }
+
     uct_base_iface_progress_disable(&self->super.super,
                                     UCT_PROGRESS_SEND | UCT_PROGRESS_RECV);
     /* Zero magic so iface will no longer be seen as valid */

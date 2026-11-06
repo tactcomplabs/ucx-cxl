@@ -113,7 +113,7 @@ typedef struct uct_cxl_md {
     /* Free uct_cxl_seg_t ranges of the RMA region, sorted by offset, with no
      * two adjacent ranges (consolidated on free)*/
     ucs_list_link_t free_list;
-    int iface_in_use;
+    bool iface_in_use;
 } uct_cxl_md_t;
 
 typedef struct uct_cxl_md_config {

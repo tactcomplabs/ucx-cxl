@@ -6,6 +6,8 @@
 #include <common/test.h>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
+#include <map>
 #include <string>
 #include <vector>
 #include <unistd.h>
@@ -15,13 +17,17 @@ extern "C" {
 }
 
 /*
- * Single-process tests of the AM FIFO (send, progress, pending). The MD's
- * local device and its aperture both map the same temp file, so the iface
- * talks to itself: tx.fifo and rx.fifo are the same slots, and remote_ctrl and
- * local_ctrl are the same control block. Every message sent is the next one
- * the iface's own progress receives, and every ack it writes is the one its
- * own send path reads. White-box access to uct_cxl_iface_t lets the tests
- * start the stream anywhere and plant half-written slots and acks.
+ * Single-process tests of the AM FIFO (send, progress, pending) and of memdev
+ * slots. Every MD's local device and its aperture map the same temp file, so
+ * the file plays both guests' memdevs. The primary iface's EP talks to itself:
+ * its tx ring and its rx ring from its own slot are the same elements, and the
+ * ack row it writes is the one its own send path reads. Every message sent is
+ * the next one the iface's own progress receives. White-box access to
+ * uct_cxl_iface_t lets the tests start the stream anywhere and plant
+ * half-written elements and acks.
+ *
+ * Further MDs opened on the same file take the other slots, which lets tests
+ * send from several slots into one.
  */
 class test_cxl_fifo : public ucs::test {
 protected:
@@ -51,9 +57,18 @@ protected:
         size_t length;
     };
 
+    /* An MD and, optionally, an iface on it and an EP from that iface */
+    struct entity {
+        uct_md_h md;
+        uct_iface_h iface;
+        uct_ep_h ep;
+    };
+
+    typedef std::map<std::string, std::string> config_map;
+
     test_cxl_fifo() :
         m_fd(-1),
-        m_md_config(NULL),
+        m_component(NULL),
         m_md(NULL),
         m_async(NULL),
         m_worker(NULL),
@@ -67,14 +82,14 @@ protected:
     {
         ucs::test::init();
 
-        uct_component_h component = find_component();
-        if (component == NULL) {
+        m_component = find_component();
+        if (m_component == NULL) {
             UCS_TEST_SKIP_R("cxl component not found");
         }
 
         /* cleanup() only runs after a successful init() */
         try {
-            open_resources(component);
+            open_resources();
         } catch (...) {
             release_resources();
             throw;
@@ -87,7 +102,7 @@ protected:
         ucs::test::cleanup();
     }
 
-    void open_resources(uct_component_h component)
+    void open_resources()
     {
         char path[] = "/tmp/uct_cxl_fifo_XXXXXX";
         m_fd        = mkstemp(path);
@@ -95,53 +110,53 @@ protected:
         m_path = path;
         ASSERT_EQ(0, ftruncate(m_fd, FILE_SIZE)) << strerror(errno);
 
-        ASSERT_UCS_OK(uct_md_config_read(component, NULL, NULL, &m_md_config));
-        modify_md_config("CXL_ACCEL_DEV", m_path);
-        modify_md_config("CXL_LOCAL_DEV", m_path);
-        modify_md_config("CXL_APERTURE_SIZE", ucs::to_string(FILE_SIZE));
-        ASSERT_UCS_OK(uct_md_open(component, "cxl", m_md_config, &m_md));
+        ASSERT_UCS_OK(open_md(config_map(), &m_md));
 
         ASSERT_UCS_OK(ucs_async_context_create(UCS_ASYNC_MODE_THREAD_SPINLOCK,
                                                &m_async));
         ASSERT_UCS_OK(
                 uct_worker_create(m_async, UCS_THREAD_MODE_SINGLE, &m_worker));
 
-        uct_iface_config_t *iface_config;
-        ASSERT_UCS_OK(uct_md_iface_config_read(m_md, "cxl", NULL, NULL,
-                                               &iface_config));
-        uct_iface_params_t iface_params = {};
-        iface_params.field_mask         = UCT_IFACE_PARAM_FIELD_OPEN_MODE |
-                                  UCT_IFACE_PARAM_FIELD_DEVICE;
-        iface_params.open_mode            = UCT_IFACE_OPEN_MODE_DEVICE;
-        iface_params.mode.device.tl_name  = "cxl";
-        iface_params.mode.device.dev_name = "cxl0";
-        ucs_status_t status = uct_iface_open(m_md, m_worker, &iface_params,
-                                             iface_config, &m_iface);
-        uct_config_release(iface_config);
-        ASSERT_UCS_OK(status);
-
+        m_iface = open_iface(m_md);
         ASSERT_UCS_OK(
                 uct_iface_set_am_handler(m_iface, AM_ID, am_handler, this, 0));
         ASSERT_UCS_OK(uct_iface_set_am_handler(m_iface, AM_ID_REPLY, am_handler,
                                                this, 0));
+        m_ep = create_ep(m_iface, m_iface);
+    }
 
-        uct_cxl_iface_addr_t addr;
-        ASSERT_UCS_OK(
-                uct_iface_get_address(m_iface, (uct_iface_addr_t *)&addr));
-        uct_ep_params_t ep_params = {};
-        ep_params.field_mask      = UCT_EP_PARAM_FIELD_IFACE |
-                               UCT_EP_PARAM_FIELD_IFACE_ADDR;
-        ep_params.iface      = m_iface;
-        ep_params.iface_addr = (const uct_iface_addr_t *)&addr;
-        ASSERT_UCS_OK(uct_ep_create(&ep_params, &m_ep));
+    static void destroy_ep(uct_ep_h ep)
+    {
+        /* The iface and EP destructors assert the pending queue is empty */
+        uct_ep_pending_purge(ep, purge_cb, NULL);
+        uct_ep_destroy(ep);
+    }
+
+    void release_entity(entity &e)
+    {
+        if (e.ep != NULL) {
+            destroy_ep(e.ep);
+        }
+        if (e.iface != NULL) {
+            uct_iface_close(e.iface);
+        }
+        if (e.md != NULL) {
+            uct_md_close(e.md);
+        }
+        e.ep    = NULL;
+        e.iface = NULL;
+        e.md    = NULL;
     }
 
     void release_resources()
     {
+        for (size_t i = m_entities.size(); i > 0; --i) {
+            release_entity(m_entities[i - 1]);
+        }
+        m_entities.clear();
+
         if (m_ep != NULL) {
-            /* The iface and EP destructors assert the pending queue is empty */
-            uct_ep_pending_purge(m_ep, purge_cb, NULL);
-            uct_ep_destroy(m_ep);
+            destroy_ep(m_ep);
         }
         if (m_iface != NULL) {
             uct_iface_close(m_iface);
@@ -155,21 +170,130 @@ protected:
         if (m_md != NULL) {
             uct_md_close(m_md);
         }
-        if (m_md_config != NULL) {
-            uct_config_release(m_md_config);
-        }
         if (m_fd >= 0) {
             close(m_fd);
             unlink(m_path.c_str());
         }
 
-        m_ep        = NULL;
-        m_iface     = NULL;
-        m_worker    = NULL;
-        m_async     = NULL;
-        m_md        = NULL;
-        m_md_config = NULL;
-        m_fd        = -1;
+        m_ep     = NULL;
+        m_iface  = NULL;
+        m_worker = NULL;
+        m_async  = NULL;
+        m_md     = NULL;
+        m_fd     = -1;
+    }
+
+    /* Open an MD on the temp file, with 'extra' MD config on top */
+    ucs_status_t open_md(const config_map &extra, uct_md_h *md_p)
+    {
+        uct_md_config_t *md_config;
+        config_map config = extra;
+        ucs_status_t status;
+
+        config.insert(std::make_pair("CXL_ACCEL_DEV", m_path));
+        config.insert(std::make_pair("CXL_LOCAL_DEV", m_path));
+        config.insert(
+                std::make_pair("CXL_APERTURE_SIZE", ucs::to_string(FILE_SIZE)));
+
+        status = uct_md_config_read(m_component, NULL, NULL, &md_config);
+        if (status != UCS_OK) {
+            return status;
+        }
+
+        for (auto it = config.begin(); it != config.end(); ++it) {
+            status = uct_config_modify(md_config, it->first.c_str(),
+                                       it->second.c_str());
+            if (status != UCS_OK) {
+                uct_config_release(md_config);
+                return status;
+            }
+        }
+
+        status = uct_md_open(m_component, "cxl", md_config, md_p);
+        uct_config_release(md_config);
+        return status;
+    }
+
+    uct_iface_h open_iface(uct_md_h md)
+    {
+        uct_iface_config_t *iface_config;
+        uct_iface_h iface = NULL;
+
+        EXPECT_UCS_OK(
+                uct_md_iface_config_read(md, "cxl", NULL, NULL, &iface_config));
+        uct_iface_params_t iface_params   = {};
+        iface_params.field_mask           = UCT_IFACE_PARAM_FIELD_OPEN_MODE |
+                                            UCT_IFACE_PARAM_FIELD_DEVICE;
+        iface_params.open_mode            = UCT_IFACE_OPEN_MODE_DEVICE;
+        iface_params.mode.device.tl_name  = "cxl";
+        iface_params.mode.device.dev_name = "cxl0";
+        ucs_status_t status = uct_iface_open(md, m_worker, &iface_params,
+                                             iface_config, &iface);
+        uct_config_release(iface_config);
+        EXPECT_UCS_OK(status);
+        return iface;
+    }
+
+    struct addresses {
+        uct_cxl_device_addr_t dev;
+        uct_cxl_iface_addr_t iface;
+    };
+
+    static addresses get_addresses(uct_iface_h iface)
+    {
+        addresses addrs;
+
+        EXPECT_UCS_OK(
+                uct_iface_get_device_address(iface,
+                                             (uct_device_addr_t *)&addrs.dev));
+        EXPECT_UCS_OK(
+                uct_iface_get_address(iface, (uct_iface_addr_t *)&addrs.iface));
+        return addrs;
+    }
+
+    /* EP on 'from' that sends to 'to' */
+    static uct_ep_h create_ep(uct_iface_h from, uct_iface_h to)
+    {
+        addresses addrs = get_addresses(to);
+        uct_ep_h ep     = NULL;
+
+        uct_ep_params_t ep_params = {};
+        ep_params.field_mask      = UCT_EP_PARAM_FIELD_IFACE |
+                                    UCT_EP_PARAM_FIELD_DEV_ADDR |
+                                    UCT_EP_PARAM_FIELD_IFACE_ADDR;
+        ep_params.iface           = from;
+        ep_params.dev_addr        = (const uct_device_addr_t *)&addrs.dev;
+        ep_params.iface_addr      = (const uct_iface_addr_t *)&addrs.iface;
+        EXPECT_UCS_OK(uct_ep_create(&ep_params, &ep));
+        return ep;
+    }
+
+    /* Open another MD on the file, with an iface and an EP to the primary
+     * iface if 'with_iface' */
+    entity &add_entity(const config_map &extra, bool with_iface)
+    {
+        entity e = {NULL, NULL, NULL};
+
+        EXPECT_UCS_OK(open_md(extra, &e.md));
+        if ((e.md != NULL) && with_iface) {
+            e.iface = open_iface(e.md);
+            if (e.iface != NULL) {
+                e.ep = create_ep(e.iface, m_iface);
+            }
+        }
+
+        m_entities.push_back(e);
+        return m_entities.back();
+    }
+
+    static unsigned md_slot(uct_md_h md)
+    {
+        return ucs_derived_of(md, uct_cxl_md_t)->slot;
+    }
+
+    unsigned my_slot()
+    {
+        return md_slot(m_md);
     }
 
     static uct_component_h find_component()
@@ -195,25 +319,35 @@ protected:
         return found;
     }
 
-    void modify_md_config(const std::string &name, const std::string &value)
-    {
-        ASSERT_UCS_OK(
-                uct_config_modify(m_md_config, name.c_str(), value.c_str()));
-    }
-
     uct_cxl_iface_t *cxl_iface()
     {
         return ucs_derived_of(m_iface, uct_cxl_iface_t);
     }
 
+    uint64_t &tx_head()
+    {
+        return cxl_iface()->tx[my_slot()].head;
+    }
+
+    uint64_t &rx_tail()
+    {
+        return cxl_iface()->rx[my_slot()].tail;
+    }
+
+    ucs_queue_head_t *tx_pending()
+    {
+        return &cxl_iface()->tx[my_slot()].pending;
+    }
+
+    /* Element of the loopback ring that stream position 'pos' uses */
     uct_cxl_fifo_elem_t *slot(uint64_t pos)
     {
-        return &cxl_iface()->rx.fifo[pos % DEPTH];
+        return &cxl_iface()->rx[my_slot()].fifo[pos % DEPTH];
     }
 
     uint64_t *ack(uint64_t pos)
     {
-        return &cxl_iface()->local_ctrl->ack[pos % DEPTH];
+        return &cxl_iface()->local_ctrl->ack[my_slot()][pos % DEPTH];
     }
 
     /*
@@ -228,8 +362,8 @@ protected:
             uct_cxl_io_write64(&slot(k)->seq, k + 1);
             uct_cxl_io_write64(ack(k), k + 1);
         }
-        cxl_iface()->tx.head = pos;
-        cxl_iface()->rx.tail = pos;
+        tx_head() = pos;
+        rx_tail() = pos;
     }
 
     static uint8_t pattern(uint64_t counter, size_t i)
@@ -238,15 +372,16 @@ protected:
     }
 
     /* am_short payload is 'length' pattern bytes after a 'counter' header */
-    ucs_status_t
-    send_short(uint64_t counter, unsigned length = 16, uint8_t am_id = AM_ID)
+    ucs_status_t send_short(uint64_t counter, unsigned length = 16,
+                            uint8_t am_id = AM_ID, uct_ep_h ep = NULL)
     {
         std::vector<uint8_t> payload(length);
 
         for (size_t i = 0; i < length; ++i) {
             payload[i] = pattern(counter, i);
         }
-        return uct_ep_am_short(m_ep, am_id, counter, payload.data(), length);
+        return uct_ep_am_short((ep == NULL) ? m_ep : ep, am_id, counter,
+                               payload.data(), length);
     }
 
     /* am_bcopy payload is 'length' bytes: 'counter', then pattern bytes */
@@ -372,9 +507,9 @@ protected:
     /* The slots and acks of the last lap before the current position */
     void check_last_lap()
     {
-        uint64_t pos = cxl_iface()->tx.head;
+        uint64_t pos = tx_head();
 
-        ASSERT_EQ(pos, cxl_iface()->rx.tail);
+        ASSERT_EQ(pos, rx_tail());
         for (uint64_t k = pos - DEPTH; k < pos; ++k) {
             EXPECT_EQ(k + 1, uct_cxl_io_read64(&slot(k)->seq)) << "k=" << k;
             EXPECT_EQ(k + 1, uct_cxl_io_read64(ack(k))) << "k=" << k;
@@ -383,7 +518,7 @@ protected:
 
     int m_fd;
     std::string m_path;
-    uct_md_config_t *m_md_config;
+    uct_component_h m_component;
     uct_md_h m_md;
     ucs_async_context_t *m_async;
     uct_worker_h m_worker;
@@ -391,6 +526,7 @@ protected:
     uct_ep_h m_ep;
     std::vector<message> m_received;
     bool m_reply_in_handler;
+    std::deque<entity> m_entities; /* add_entity() returns references */
 };
 
 /* Definitions for members gtest's assertions bind by reference */
@@ -440,13 +576,13 @@ UCS_TEST_F(test_cxl_fifo, am_bcopy) {
 
 UCS_TEST_F(test_cxl_fifo, wraparound_one_at_a_time) {
     run_one_at_a_time(3 * DEPTH + 7);
-    EXPECT_EQ(3 * DEPTH + 7, cxl_iface()->tx.head);
+    EXPECT_EQ(3 * DEPTH + 7, tx_head());
     check_last_lap();
 }
 
 UCS_TEST_F(test_cxl_fifo, wraparound_laps) {
     run_laps(4);
-    EXPECT_EQ(4 * DEPTH, cxl_iface()->tx.head);
+    EXPECT_EQ(4 * DEPTH, tx_head());
     check_last_lap();
 }
 
@@ -456,12 +592,12 @@ UCS_TEST_F(test_cxl_fifo, wraparound_2_32) {
 
     set_stream_position(start);
     run_one_at_a_time(DEPTH + 7);
-    EXPECT_EQ(start + DEPTH + 7, cxl_iface()->tx.head);
+    EXPECT_EQ(start + DEPTH + 7, tx_head());
 
     m_received.clear();
     set_stream_position(start);
     run_laps(3);
-    EXPECT_EQ(start + 3 * DEPTH, cxl_iface()->tx.head);
+    EXPECT_EQ(start + 3 * DEPTH, tx_head());
     check_last_lap();
 }
 
@@ -482,8 +618,8 @@ UCS_TEST_F(test_cxl_fifo, full_fifo_pending) {
     EXPECT_EQ(DEPTH, progress());
     EXPECT_EQ(DEPTH, m_received.size());
     EXPECT_EQ(1u, req.calls);
-    EXPECT_EQ(DEPTH + 1, cxl_iface()->tx.head);
-    EXPECT_TRUE(ucs_queue_is_empty(&cxl_iface()->tx.pending));
+    EXPECT_EQ(DEPTH + 1, tx_head());
+    EXPECT_TRUE(ucs_queue_is_empty(tx_pending()));
 
     EXPECT_EQ(1u, progress());
     ASSERT_EQ(DEPTH + 1, m_received.size());
@@ -492,6 +628,34 @@ UCS_TEST_F(test_cxl_fifo, full_fifo_pending) {
     }
     EXPECT_EQ(1u, req.calls);
     EXPECT_EQ(0u, req.purged);
+}
+
+/* Flush can't complete while sends wait for a free element; the caller
+ * queues it behind them like a send */
+UCS_TEST_F(test_cxl_fifo, flush_full_fifo) {
+    pending_req req;
+
+    EXPECT_UCS_OK(uct_ep_flush(m_ep, 0, NULL));
+    EXPECT_UCS_OK(uct_iface_flush(m_iface, 0, NULL));
+
+    fill(0);
+    EXPECT_EQ(UCS_ERR_NO_RESOURCE, uct_ep_flush(m_ep, 0, NULL));
+
+    /* With the ring drained but a request still pending */
+    init_pending(&req, DEPTH);
+    ASSERT_UCS_OK(uct_ep_pending_add(m_ep, &req.uct, 0));
+    uct_cxl_io_write64(ack(0), 1); /* free element 0 without progress */
+    EXPECT_EQ(UCS_ERR_NO_RESOURCE, uct_ep_flush(m_ep, 0, NULL));
+
+    /* The iface isn't flushed either: UCP completes a worker flush when all
+     * ifaces are */
+    EXPECT_EQ(UCS_INPROGRESS, uct_iface_flush(m_iface, 0, NULL));
+
+    /* Progress acks the ring and sends the pending request */
+    EXPECT_EQ(DEPTH, progress());
+    EXPECT_EQ(1u, req.calls);
+    EXPECT_UCS_OK(uct_ep_flush(m_ep, 0, NULL));
+    EXPECT_UCS_OK(uct_iface_flush(m_iface, 0, NULL));
 }
 
 /* A free slot must not let a new send overtake a queued pending request */
@@ -504,7 +668,7 @@ UCS_TEST_F(test_cxl_fifo, pending_no_overtake) {
 
     /* Free slot 0 as the peer would, without running progress */
     uct_cxl_io_write64(ack(0), 1);
-    EXPECT_TRUE(uct_cxl_iface_tx_slot_free(cxl_iface()));
+    EXPECT_TRUE(uct_cxl_iface_tx_slot_free(cxl_iface(), my_slot()));
     EXPECT_EQ(UCS_ERR_NO_RESOURCE, send_short(DEPTH + 1));
     EXPECT_EQ((ssize_t)UCS_ERR_NO_RESOURCE, send_bcopy(DEPTH + 1, 16));
     EXPECT_EQ(0u, req.calls);
@@ -529,7 +693,7 @@ UCS_TEST_F(test_cxl_fifo, pending_purge) {
     }
 
     uct_ep_pending_purge(m_ep, purge_cb, NULL);
-    EXPECT_TRUE(ucs_queue_is_empty(&cxl_iface()->tx.pending));
+    EXPECT_TRUE(ucs_queue_is_empty(tx_pending()));
     for (size_t i = 0; i < 2; ++i) {
         EXPECT_EQ(1u, reqs[i].purged) << "i=" << i;
         EXPECT_EQ(0u, reqs[i].calls) << "i=" << i;
@@ -576,7 +740,7 @@ UCS_TEST_F(test_cxl_fifo, half_written_seq) {
         uct_cxl_io_write64(&elem->seq, bad_seqs[i]);
         EXPECT_EQ(0u, progress()) << "seq=" << bad_seqs[i];
         EXPECT_EQ(0u, m_received.size()) << "seq=" << bad_seqs[i];
-        EXPECT_EQ(pos, cxl_iface()->rx.tail) << "seq=" << bad_seqs[i];
+        EXPECT_EQ(pos, rx_tail()) << "seq=" << bad_seqs[i];
         EXPECT_EQ(ack_before, uct_cxl_io_read64(ack(pos)))
                 << "seq=" << bad_seqs[i];
     }
@@ -586,7 +750,7 @@ UCS_TEST_F(test_cxl_fifo, half_written_seq) {
     ASSERT_EQ(1u, m_received.size());
     ASSERT_EQ(length, m_received[0].data.size());
     EXPECT_EQ(0, memcmp(payload, m_received[0].data.data(), length));
-    EXPECT_EQ(pos + 1, cxl_iface()->rx.tail);
+    EXPECT_EQ(pos + 1, rx_tail());
     EXPECT_EQ(expected, uct_cxl_io_read64(ack(pos)));
 }
 
@@ -610,7 +774,7 @@ UCS_TEST_F(test_cxl_fifo, half_written_ack) {
         EXPECT_EQ(UCS_ERR_NO_RESOURCE, send_short(0)) << "ack=" << bad_acks[i];
         EXPECT_EQ((ssize_t)UCS_ERR_NO_RESOURCE, send_bcopy(0, 16))
                 << "ack=" << bad_acks[i];
-        EXPECT_EQ(pos, cxl_iface()->tx.head) << "ack=" << bad_acks[i];
+        EXPECT_EQ(pos, tx_head()) << "ack=" << bad_acks[i];
         EXPECT_EQ(pos + 1 - DEPTH, uct_cxl_io_read64(&slot(pos)->seq))
                 << "ack=" << bad_acks[i];
     }
@@ -640,7 +804,7 @@ UCS_TEST_F(test_cxl_fifo, send_from_handler) {
     EXPECT_EQ(AM_ID, m_received[0].am_id);
     check_short(0, 1);
     EXPECT_EQ(AM_ID_REPLY, m_received[1].am_id);
-    EXPECT_EQ(2u, cxl_iface()->rx.tail);
+    EXPECT_EQ(2u, rx_tail());
     EXPECT_EQ(0u, progress());
 }
 
@@ -656,4 +820,222 @@ UCS_TEST_F(test_cxl_fifo, send_from_handler_full) {
     EXPECT_EQ(1u, progress());
     ASSERT_EQ(DEPTH + 1, m_received.size());
     EXPECT_EQ(AM_ID_REPLY, m_received[DEPTH].am_id);
+}
+
+/* MDs on one memdev take the free slots in order, and a slot is released
+ * when its MD closes */
+UCS_TEST_F(test_cxl_fifo, slot_auto_lock) {
+    const unsigned nslots = 4; /* the default */
+    std::vector<uct_md_h> mds;
+    uct_md_h md;
+
+    EXPECT_EQ(0u, my_slot());
+    for (unsigned slot = 1; slot < nslots; ++slot) {
+        ASSERT_UCS_OK(open_md(config_map(), &md));
+        EXPECT_EQ(slot, md_slot(md));
+        mds.push_back(md);
+    }
+
+    {
+        scoped_log_handler wrap_err(wrap_errors_logger);
+        EXPECT_EQ(UCS_ERR_BUSY, open_md(config_map(), &md));
+    }
+
+    /* Closing the MD in slot 2 frees exactly that slot */
+    uct_md_close(mds[1]);
+    ASSERT_UCS_OK(open_md(config_map(), &md));
+    EXPECT_EQ(2u, md_slot(md));
+    mds[1] = md;
+
+    for (size_t i = 0; i < mds.size(); ++i) {
+        uct_md_close(mds[i]);
+    }
+}
+
+UCS_TEST_F(test_cxl_fifo, slot_forced) {
+    config_map config;
+    uct_md_h md, md2;
+
+    config["CXL_SLOT"] = "3";
+    ASSERT_UCS_OK(open_md(config, &md));
+    EXPECT_EQ(3u, md_slot(md));
+
+    {
+        scoped_log_handler wrap_err(wrap_errors_logger);
+        EXPECT_EQ(UCS_ERR_BUSY, open_md(config, &md2));
+        config["CXL_SLOT"] = "4"; /* out of range for 4 slots */
+        EXPECT_EQ(UCS_ERR_INVALID_PARAM, open_md(config, &md2));
+    }
+
+    uct_md_close(md);
+}
+
+/*
+ * Two slots send into the primary iface's slot concurrently. Each sender has
+ * its own ring, so each stream stays in order, and one sender's full ring
+ * doesn't block the other.
+ */
+UCS_TEST_F(test_cxl_fifo, two_senders) {
+    const uint64_t tag[] = {1ull << 48, 2ull << 48};
+    std::vector<uint64_t> next(2, 0);
+    entity *senders[2];
+
+    for (unsigned i = 0; i < 2; ++i) {
+        senders[i] = &add_entity(config_map(), true);
+        ASSERT_TRUE(senders[i]->ep != NULL);
+        EXPECT_EQ(i + 1, md_slot(senders[i]->md));
+    }
+
+    /* Interleave sends until the first sender's ring is full */
+    for (uint64_t k = 0; k < DEPTH; ++k) {
+        ASSERT_UCS_OK(send_short(tag[0] + k, 16, AM_ID, senders[0]->ep));
+        if (k < DEPTH / 2) {
+            ASSERT_UCS_OK(send_short(tag[1] + k, 16, AM_ID, senders[1]->ep));
+        }
+    }
+    EXPECT_EQ(UCS_ERR_NO_RESOURCE,
+              send_short(tag[0] + DEPTH, 16, AM_ID, senders[0]->ep));
+    ASSERT_UCS_OK(send_short(tag[1] + DEPTH / 2, 16, AM_ID, senders[1]->ep));
+
+    /* Progress takes at most DEPTH elements per call, across all rings */
+    while (progress() > 0) {
+    }
+    ASSERT_EQ(DEPTH + DEPTH / 2 + 1, m_received.size());
+
+    for (size_t i = 0; i < m_received.size(); ++i) {
+        uint64_t header;
+        unsigned sender;
+
+        memcpy(&header, m_received[i].data.data(), sizeof(header));
+        sender = (header >> 48) - 1;
+        ASSERT_LT(sender, 2u) << "i=" << i;
+        check_short(i, tag[sender] + next[sender]);
+        ++next[sender];
+    }
+    EXPECT_EQ(DEPTH, next[0]);
+    EXPECT_EQ(DEPTH / 2 + 1, next[1]);
+
+    /* The acks freed the first sender's ring */
+    EXPECT_UCS_OK(send_short(tag[0] + DEPTH, 16, AM_ID, senders[0]->ep));
+    EXPECT_EQ(1u, progress());
+}
+
+/* Same-node peers are unreachable; a peer on another node is reachable once
+ * its control block matches its address */
+UCS_TEST_F(test_cxl_fifo, reachability) {
+    config_map config;
+    char info[256];
+
+    config["CXL_NODE_ID"] = "12345";
+    entity &other         = add_entity(config, true);
+    ASSERT_TRUE(other.iface != NULL);
+
+    addresses self_addrs  = get_addresses(m_iface);
+    addresses other_addrs = get_addresses(other.iface);
+    EXPECT_EQ(12345u, other_addrs.dev);
+    EXPECT_NE(self_addrs.dev, other_addrs.dev);
+
+    uct_iface_is_reachable_params_t params = {};
+    params.field_mask         = UCT_IFACE_IS_REACHABLE_FIELD_DEVICE_ADDR |
+                                UCT_IFACE_IS_REACHABLE_FIELD_IFACE_ADDR |
+                                UCT_IFACE_IS_REACHABLE_FIELD_INFO_STRING |
+                                UCT_IFACE_IS_REACHABLE_FIELD_INFO_STRING_LENGTH;
+    params.info_string        = info;
+    params.info_string_length = sizeof(info);
+
+    /* Same node, even the primary itself */
+    params.device_addr = (const uct_device_addr_t *)&self_addrs.dev;
+    params.iface_addr  = (const uct_iface_addr_t *)&self_addrs.iface;
+    EXPECT_FALSE(uct_iface_is_reachable_v2(m_iface, &params));
+
+    params.device_addr = (const uct_device_addr_t *)&other_addrs.dev;
+    params.iface_addr  = (const uct_iface_addr_t *)&other_addrs.iface;
+    EXPECT_TRUE(uct_iface_is_reachable_v2(m_iface, &params)) << info;
+
+    /* Never intra-node */
+    params.field_mask |= UCT_IFACE_IS_REACHABLE_FIELD_SCOPE;
+    params.scope = UCT_IFACE_REACHABILITY_SCOPE_DEVICE;
+    EXPECT_FALSE(uct_iface_is_reachable_v2(m_iface, &params));
+    params.field_mask &= ~UCT_IFACE_IS_REACHABLE_FIELD_SCOPE;
+
+    /* Stale iface id, e.g. the process in that slot restarted */
+    uct_cxl_iface_addr_t stale = other_addrs.iface;
+    ++stale.id;
+    params.iface_addr = (const uct_iface_addr_t *)&stale;
+    EXPECT_FALSE(uct_iface_is_reachable_v2(m_iface, &params));
+
+    /* Slot out of range */
+    stale      = other_addrs.iface;
+    stale.slot = UCT_CXL_MAX_SLOTS;
+    EXPECT_FALSE(uct_iface_is_reachable_v2(m_iface, &params));
+
+    /* Once the iface closes, its slot no longer looks initialized */
+    params.iface_addr = (const uct_iface_addr_t *)&other_addrs.iface;
+    release_entity(other);
+    EXPECT_FALSE(uct_iface_is_reachable_v2(m_iface, &params));
+}
+
+/* mem_alloc hands out the MD's own slot, and RMA can reach exactly the RMA
+ * region of a slot */
+UCS_TEST_F(test_cxl_fifo, rma_slot_bounds) {
+    entity &other     = add_entity(config_map(), false);
+    uct_cxl_md_t *cmd = ucs_derived_of(other.md, uct_cxl_md_t);
+    const size_t size = 4096;
+    uct_md_mkey_pack_params_t pack_params = {};
+    uct_allocated_memory_t mem;
+    uint8_t packed[sizeof(uct_cxl_packed_rkey_t)];
+    uct_rkey_bundle_t rkey;
+    uint64_t offset, value = 0x1122334455667788ull;
+
+    ASSERT_TRUE(other.md != NULL);
+    ASSERT_EQ(1u, md_slot(other.md));
+
+    uct_mem_alloc_params_t params = {};
+    params.field_mask             = UCT_MEM_ALLOC_PARAM_FIELD_FLAGS |
+                                    UCT_MEM_ALLOC_PARAM_FIELD_MDS |
+                                    UCT_MEM_ALLOC_PARAM_FIELD_MEM_TYPE |
+                                    UCT_MEM_ALLOC_PARAM_FIELD_NAME;
+    params.flags                  = UCT_MD_MEM_ACCESS_ALL;
+    params.mds.mds                = &other.md;
+    params.mds.count              = 1;
+    params.mem_type               = UCS_MEMORY_TYPE_HOST;
+    params.name                   = "test_cxl_rma";
+    uct_alloc_method_t method     = UCT_ALLOC_METHOD_MD;
+    ASSERT_UCS_OK(uct_mem_alloc(size, &method, 1, &params, &mem));
+
+    offset = UCS_PTR_BYTE_DIFF(cmd->local_base, mem.address);
+    EXPECT_EQ(cmd->slot_size + UCT_CXL_RMA_OFFSET, offset);
+
+    ASSERT_UCS_OK(uct_md_mkey_pack_v2(other.md, mem.memh, mem.address, size,
+                                      &pack_params, packed));
+    ASSERT_UCS_OK(uct_rkey_unpack(m_component, packed, &rkey));
+
+    /* The primary EP writes into slot 1's RMA region */
+    ASSERT_UCS_OK(uct_ep_put_short(m_ep, &value, sizeof(value),
+                                   (uintptr_t)mem.address, rkey.rkey));
+    EXPECT_EQ(value, *(volatile uint64_t *)mem.address);
+
+    /* Past the end of the segment */
+    {
+        scoped_log_handler wrap_err(wrap_errors_logger);
+        EXPECT_EQ(UCS_ERR_INVALID_PARAM,
+                  uct_ep_put_short(m_ep, &value, sizeof(value),
+                                   (uintptr_t)mem.address + size - 4,
+                                   rkey.rkey));
+    }
+
+    /* A forged rkey reaching into the next slot's control block */
+    uct_cxl_packed_rkey_t forged = {cmd->slot_size * 2 - 64, 0x1000, 128};
+    uct_rkey_bundle_t forged_rkey;
+    ASSERT_UCS_OK(uct_rkey_unpack(m_component, &forged, &forged_rkey));
+    {
+        scoped_log_handler wrap_err(wrap_errors_logger);
+        EXPECT_EQ(UCS_ERR_INVALID_PARAM,
+                  uct_ep_put_short(m_ep, &value, sizeof(value), 0x1000 + 64,
+                                   forged_rkey.rkey));
+    }
+
+    uct_rkey_release(m_component, &forged_rkey);
+    uct_rkey_release(m_component, &rkey);
+    uct_mem_free(&mem);
 }
